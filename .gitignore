@@ -1,0 +1,59 @@
+# Rust / Cargo
+target/
+**/target/
+debug/
+*.rlib
+*.rmeta
+
+# Build artifacts & profiling
+*.dSYM/
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+
+# Editor / IDE
+.cursor/
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs & temp files
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# Generated media captures (placeholder if dev tools dump here)
+captures/
+recordings/
+screenshots/
+
+# Miscellaneous
+node_modules/
+dist/
+coverage/
+
+# Generated media captures (placeholder if dev tools dump here)
+captures/
+recordings/
+screenshots/
+
+# Dev assets
+crates/hudagents-capture/assets/

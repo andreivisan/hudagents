@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/hudagents-capture"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "HudAgents: Rust backend for Hudward smart glasses"
+repository = "https://github.com/hudward/hudagents"
+keywords = ["agents", "ar", "vision"]
+categories = []
+
+[workspace.dependencies]
