@@ -13,3 +13,4 @@ keywords = ["agents", "ar", "vision"]
 categories = []
 
 [workspace.dependencies]
+hudagents-local = { path = "crates/hudagents-local" }
