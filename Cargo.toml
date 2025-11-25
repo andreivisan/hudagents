@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-default-members = ["crates/hudagents-capture"]
+default-members = ["crates/hudagents-capture, crates/hudagents-local"]
 
 [workspace.package]
 version = "0.1.0"
