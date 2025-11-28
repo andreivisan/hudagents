@@ -14,17 +14,17 @@ To begin with, we support **two local components**:
    - Transcribes audio from the user into text.
    - Implemented via `whisper.cpp` (or compatible HTTP wrapper).
 
-2. **Gemma (vision LLM)**  
+2. **Qwen3-VL (vision LLM)**  
    - Takes:
      - the transcription from Whisper,
      - the current image (if any),
      - sliding-window conversation context (from `hudagents-core`),
    - and returns a textual reply.
-   - Implemented via **Ollama**, using a Gemma model (e.g. `gemma:2b` or similar).
+   - Implemented via **Ollama**, using a Qwen3-VL model.
 
 These are **local agents** to give users the option of *full privacy* when they run everything on their own machines or servers.
 
-Internally, this crate will expose a **single orchestrator type** (e.g. `LocalAgent`) that implements `AgentBackend` and calls Whisper + Gemma under the hood.  
+Internally, this crate will expose a **single orchestrator type** (e.g. `LocalAgent`) that implements `AgentBackend` and calls Whisper + Qwen3-VL under the hood.  
 That API will be documented once the implementation stabilizes.
 
 ## 2. Deployment modes
@@ -43,15 +43,8 @@ In this mode:
 
 - The user is responsible for:
   - Installing and running **Ollama**.
-  - Pulling the desired Gemma models via Ollama (`ollama pull gemma:...`).
+  - Pulling the desired Qwen3-VL models via Ollama (`ollama pull ...`).
 - The backend is responsible for:
   - Detecting whether a suitable **Whisper model** is available.
-  - If not, offering to **download the appropriate Whisper model** based on configuration (e.g. model size, language).
+  - If not, using hudagents-tools' CLI to download the **Whisper model** that suits best the user's system configuration.
   - Reporting clear errors if local services are unreachable.
-
-The Whisper model download helper will likely be exposed via **CLI tools** belonging to this crate (or workspace), *not* hard-wired into the core library logic.  
-Example idea (not final API):
-
-```bash
-hudagents-local whisper download --model base.en --dest ~/.hudagents/models
-```
