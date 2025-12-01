@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use sysinfo::System;
+use sysinfo::{System};
 use whisper_rs::{print_system_info, SystemInfo};
 
 #[derive(Parser)]
-#[command {name = "hudagents-tools"}]
+#[command (name = "hudagents-tools")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -47,8 +47,8 @@ fn sysinfo() -> &'static str{
     println!("--- Whisper System Info ---");
     println!("{}", print_system_info());
     
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let mut sys = System::new();
+    sys.refresh_memory();
     let total_ram_gb = sys.total_memory() / 1024 / 1024 / 1024;
     println!("Total RAM: {} GB", total_ram_gb);
     let cpu_info = SystemInfo::default();
@@ -57,12 +57,11 @@ fn sysinfo() -> &'static str{
         Backend::AppleSilicon => {
             println!("Detected Apple Silicon (M-series). Metal acceleration available.");
             match total_ram_gb {
-                0..=7 => unreachable!(),
+                0..=7 => "base",
                 8..=16 => "small",
                 17..=32 => "medium",   
                 33..=64 => "large",   
-                65..=128 => "large-v3", 
-                129..=u64::MAX => "large-v3",
+                _ => "large-v3",
             }
         }
         Backend::IntelMac => {
