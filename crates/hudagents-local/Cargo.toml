@@ -9,4 +9,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-whisper-rs = { version = "0.15.1", features = ["metal"] }
+whisper-rs = { workspace = true }

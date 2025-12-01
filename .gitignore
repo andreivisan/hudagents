@@ -58,3 +58,4 @@ screenshots/
 # Dev assets
 crates/hudagents-capture/assets/
 .models/
+crates/hudagents-tools/src/download-ggml-model.sh
