@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use sysinfo::System;
 use whisper_rs::print_system_info;
 
 #[derive(Parser)]
@@ -23,6 +24,11 @@ enum Commands {
 fn sysinfo() {
     println!("--- Whisper System Info ---");
     println!("{}", print_system_info());
+    
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let total_ram_gb = sys.total_memory() / 1024 / 1024 / 1024;
+    println!("Total RAM: {} GB", total_ram_gb);
 }
 
 fn main() {
