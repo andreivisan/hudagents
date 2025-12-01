@@ -1,5 +1,5 @@
 use std::{
-    fmt::{self, Display}, 
+    fmt::{self, Display, Debug}, 
     error::Error,
     path::Path,
 };
@@ -35,6 +35,24 @@ pub struct HALocalWhisper {
     whisper_ctx: WhisperContext,
 }
 
+impl Debug for HALocalWhisper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let model_type = self.whisper_ctx
+            .model_type_readable_str_lossy()
+            .unwrap_or("unknown".into());
+
+        f.debug_struct("HALocalWhisper")
+            // Create a custom formatted string for the context field
+            .field("whisper_ctx", &format_args!(
+                "WhisperContext {{ model: {:?}, multilingual: {}, vocab: {} }}",
+                model_type,
+                self.whisper_ctx.is_multilingual(),
+                self.whisper_ctx.n_vocab()
+            ))
+            .finish()
+    }
+}
+
 impl HALocalWhisper {
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self, HAWhisperError> {
         let path = model_path.as_ref();
@@ -47,5 +65,37 @@ impl HALocalWhisper {
         ).map_err(|e| HAWhisperError::ModelInitFailed(format!("Error loading model at {:?}: {:?}", path, e)))?;
         
         Ok(Self { whisper_ctx })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_fails_when_model_not_found() {
+        let bad_path = "bad/path/to/model.bin";
+        let result = HALocalWhisper::new(bad_path);
+
+        assert!(result.is_err());
+
+        match result {
+            Err(HAWhisperError::ModelNotFound(path)) => assert_eq!(path, bad_path),
+            _ => panic!("Expected ModelNotFound error, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_new_fails_when_model_init_failed() {
+        let dummy = "dummy_model.bin";
+        { std::fs::File::create(dummy).unwrap(); }
+        let result = HALocalWhisper::new(dummy);
+        
+        assert!(result.is_err());
+
+        match result {
+            Err(HAWhisperError::ModelInitFailed(msg)) => assert!(msg.contains(dummy)),
+            _ => panic!("Expected ModelInitFailed error, got {:?}", result),
+        }
     }
 }
