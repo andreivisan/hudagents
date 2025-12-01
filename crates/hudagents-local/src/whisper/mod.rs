@@ -71,6 +71,7 @@ impl HALocalWhisper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{ File, remove_file };
 
     #[test]
     fn test_new_fails_when_model_not_found() {
@@ -88,7 +89,7 @@ mod tests {
     #[test]
     fn test_new_fails_when_model_init_failed() {
         let dummy = "dummy_model.bin";
-        { std::fs::File::create(dummy).unwrap(); }
+        { File::create(dummy).unwrap(); }
         let result = HALocalWhisper::new(dummy);
         
         assert!(result.is_err());
@@ -97,5 +98,7 @@ mod tests {
             Err(HAWhisperError::ModelInitFailed(msg)) => assert!(msg.contains(dummy)),
             _ => panic!("Expected ModelInitFailed error, got {:?}", result),
         }
+
+        remove_file(dummy).unwrap();
     }
 }
