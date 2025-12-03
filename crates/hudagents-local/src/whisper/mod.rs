@@ -8,6 +8,7 @@ use whisper_rs::{WhisperContext, WhisperContextParameters};
 #[derive(Debug)]
 pub enum HAWhisperError {
     ModelNotFound(String),
+    InvalidModelName(String),
     ModelInitFailed(String),
 }
 
@@ -19,7 +20,8 @@ impl Display for HAWhisperError {
                 Use `hudagents-tools sysinfo` to get the recommended model for your system, or\n\
                 Use `hudagents-tools download --model <model> --path <path>` to download the model"
                 , path
-            ), 
+            ),
+            HAWhisperError::InvalidModelName(model) => write!(f, "Invalid model name: {}", model),
             HAWhisperError::ModelInitFailed(msg) => write!(f, "Failed to initialize Whisper context: {}", msg),
         }
     }

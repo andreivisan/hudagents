@@ -1,6 +1,19 @@
 use clap::{Parser, Subcommand};
+use hudagents_local::whisper::HAWhisperError;
 use sysinfo::{System};
+use std::{path::Path, result::Result};
 use whisper_rs::{print_system_info, SystemInfo};
+
+const MODEL_LOCATION_PATH: &str = "hudagents/.models";
+const DOWNLOAD_URL: &str = "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main/ggml";
+const AVAILABLE_MODELS: &[&str] = &[
+    "tiny", "tiny.en", "tiny-q5_1", "tiny.en-q5_1", "tiny-q8_0",
+    "base", "base.en", "base-q5_1", "base.en-q5_1", "base-q8_0",
+    "small", "small.en", "small.en-tdrz", "small-q5_1", "small.en-q5_1", "small-q8_0",
+    "medium", "medium.en", "medium-q5_0", "medium.en-q5_0", "medium-q8_0",
+    "large-v1", "large-v2", "large-v2-q5_0", "large-v2-q8_0",
+    "large-v3", "large-v3-q5_0", "large-v3-turbo", "large-v3-turbo-q5_0", "large-v3-turbo-q8_0"
+];
 
 #[derive(Parser)]
 #[command (name = "hudagents-tools")]
@@ -90,6 +103,20 @@ fn sysinfo() -> &'static str{
             }
         }
     }
+}
+
+fn determine_download_url(model: &str) -> (&'static str, &'static str) {
+    match model.contains("tdrz") {
+        true => ("https://huggingface.co/akashmjn/tinydiarize-whisper.cpp", "resolve/main/ggml"),
+        false => ("https://huggingface.co/ggerganov/whisper.cpp", "resolve/main/ggml"),
+    }
+}
+
+fn download_model(model: &str, custom_path: Option<&Path>) -> Result<(), HAWhisperError> {
+    if !AVAILABLE_MODELS.contains(&model) {
+        return Err(HAWhisperError::InvalidModelName(model.to_string()));
+    }
+    Ok(())
 }
 
 fn main() {
