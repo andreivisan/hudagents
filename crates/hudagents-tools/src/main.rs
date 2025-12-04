@@ -1,28 +1,52 @@
 use clap::{Parser, Subcommand};
 use hudagents_local::whisper::HAWhisperError;
-use sysinfo::{System};
 use std::{
     env,
-    fs::{create_dir_all, File},
+    fs::{File, create_dir_all},
     io::copy,
-    path::{Path, PathBuf}, 
+    path::{Path, PathBuf},
     result::Result,
 };
-use whisper_rs::{print_system_info, SystemInfo};
+use sysinfo::System;
+use whisper_rs::{SystemInfo, print_system_info};
 
 pub mod debug;
 
 const AVAILABLE_MODELS: &[&str] = &[
-    "tiny", "tiny.en", "tiny-q5_1", "tiny.en-q5_1", "tiny-q8_0",
-    "base", "base.en", "base-q5_1", "base.en-q5_1", "base-q8_0",
-    "small", "small.en", "small.en-tdrz", "small-q5_1", "small.en-q5_1", "small-q8_0",
-    "medium", "medium.en", "medium-q5_0", "medium.en-q5_0", "medium-q8_0",
-    "large-v1", "large-v2", "large-v2-q5_0", "large-v2-q8_0",
-    "large-v3", "large-v3-q5_0", "large-v3-turbo", "large-v3-turbo-q5_0", "large-v3-turbo-q8_0"
+    "tiny",
+    "tiny.en",
+    "tiny-q5_1",
+    "tiny.en-q5_1",
+    "tiny-q8_0",
+    "base",
+    "base.en",
+    "base-q5_1",
+    "base.en-q5_1",
+    "base-q8_0",
+    "small",
+    "small.en",
+    "small.en-tdrz",
+    "small-q5_1",
+    "small.en-q5_1",
+    "small-q8_0",
+    "medium",
+    "medium.en",
+    "medium-q5_0",
+    "medium.en-q5_0",
+    "medium-q8_0",
+    "large-v1",
+    "large-v2",
+    "large-v2-q5_0",
+    "large-v2-q8_0",
+    "large-v3",
+    "large-v3-q5_0",
+    "large-v3-turbo",
+    "large-v3-turbo-q5_0",
+    "large-v3-turbo-q8_0",
 ];
 
 #[derive(Parser)]
-#[command (name = "hudagents-tools")]
+#[command(name = "hudagents-tools")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -36,7 +60,7 @@ enum Commands {
         model: String,
         #[arg(long)]
         path: Option<String>,
-    }
+    },
 }
 
 enum Backend {
@@ -61,10 +85,10 @@ fn resolve_backend() -> Backend {
     }
 }
 
-fn sysinfo() -> &'static str{
+fn sysinfo() -> &'static str {
     debug!(2, "--- Whisper System Info ---");
     debug!(2, "{}", print_system_info());
-    
+
     let mut sys = System::new();
     sys.refresh_memory();
     let total_ram_gb = sys.total_memory() / 1024 / 1024 / 1024;
@@ -77,8 +101,8 @@ fn sysinfo() -> &'static str{
             match total_ram_gb {
                 0..=7 => "base",
                 8..=16 => "small",
-                17..=32 => "medium",   
-                33..=64 => "large",   
+                17..=32 => "medium",
+                33..=64 => "large",
                 _ => "large-v3",
             }
         }
@@ -111,9 +135,16 @@ fn sysinfo() -> &'static str{
 }
 
 fn determine_download_url(model: &str) -> (&'static str, &'static str) {
-    match model.contains("tdrz") {
-        true => ("https://huggingface.co/akashmjn/tinydiarize-whisper.cpp", "resolve/main/ggml"),
-        false => ("https://huggingface.co/ggerganov/whisper.cpp", "resolve/main/ggml"),
+    if model.contains("tdrz") {
+        return (
+            "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp",
+            "resolve/main/ggml",
+        );
+    } else {
+        return (
+            "https://huggingface.co/ggerganov/whisper.cpp",
+            "resolve/main/ggml",
+        );
     }
 }
 
@@ -125,15 +156,21 @@ fn download_model(model: &str, custom_path: Option<&Path>) -> Result<(), HAWhisp
     let target_dir = match custom_path {
         Some(path) => PathBuf::from(path),
         None => {
-            if let Some(env_path) = env::var_os("HA_WHISPER_PATH") { PathBuf::from(env_path) }
-            else { PathBuf::from(".models") }
-        },
+            if let Some(env_path) = env::var_os("HA_WHISPER_PATH") {
+                PathBuf::from(env_path)
+            } else {
+                PathBuf::from(".models")
+            }
+        }
     };
     create_dir_all(&target_dir).map_err(HAWhisperError::IOError)?;
     let filename = format!("{model}.bin");
     let file_path = target_dir.join(&filename);
     if file_path.exists() {
-        println!("Model {} already exists at {:?}. Skipping download.", model, file_path);
+        println!(
+            "Model {} already exists at {:?}. Skipping download.",
+            model, file_path
+        );
         return Ok(());
     }
     let (base_url, prefix) = determine_download_url(model);
@@ -141,7 +178,9 @@ fn download_model(model: &str, custom_path: Option<&Path>) -> Result<(), HAWhisp
     println!("Downloading model {} from '{}' ...", model, url);
     println!("Saving to {:?}", file_path);
     let mut response = reqwest::blocking::get(url).map_err(HAWhisperError::HttpRequestFailed)?;
-    if !response.status().is_success() { return Err(HAWhisperError::HttpStatus(response.status())); }
+    if !response.status().is_success() {
+        return Err(HAWhisperError::HttpStatus(response.status()));
+    }
     let mut dest_file = match File::create(&file_path) {
         Ok(file) => file,
         Err(e) => return Err(HAWhisperError::IOError(e)),
@@ -159,10 +198,14 @@ fn main() {
         Commands::Sysinfo => {
             let recommendation = sysinfo();
             println!("Recommended model: {}", recommendation);
-        }   
+        }
         Commands::Download { model, path } => {
             let custom_path = path.as_deref().map(Path::new);
-            println!("Downloading model {} to {}", model, path.as_deref().unwrap_or(".models"));
+            println!(
+                "Downloading model {} to {}",
+                model,
+                path.as_deref().unwrap_or(".models")
+            );
             match download_model(&model, custom_path) {
                 Ok(_) => println!("Model downloaded successfully."),
                 Err(e) => println!("Error downloading model: {}", e),
