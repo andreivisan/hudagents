@@ -161,7 +161,7 @@ fn main() {
         }   
         Commands::Download { model, path } => {
             println!("Downloading model {} to {}", model, path.unwrap_or_default());
-            match download_model("medium.en", None) {
+            match download_model(&model, None) {
                 Ok(_) => println!("Model downloaded successfully."),
                 Err(e) => println!("Error downloading model: {}", e),
             }
