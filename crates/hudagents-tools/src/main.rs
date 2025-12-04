@@ -3,7 +3,7 @@ use hudagents_local::whisper::HAWhisperError;
 use sysinfo::{System};
 use std::{
     env,
-    fs::File,
+    fs::{create_dir_all, File},
     io::copy,
     path::{Path, PathBuf}, 
     result::Result,
@@ -128,7 +128,7 @@ fn download_model(model: &str, custom_path: Option<&Path>) -> Result<(), HAWhisp
             else { PathBuf::from(".models") }
         },
     };
-    //TODO: If target_dir does not exist, create it
+    create_dir_all(&target_dir).map_err(HAWhisperError::IOError)?;
     let filename = format!("{model}.bin");
     let file_path = target_dir.join(&filename);
     if file_path.exists() {
@@ -160,8 +160,9 @@ fn main() {
             println!("Recommended model: {}", recommendation);
         }   
         Commands::Download { model, path } => {
-            println!("Downloading model {} to {}", model, path.unwrap_or_default());
-            match download_model(&model, None) {
+            let custom_path = path.as_deref().map(Path::new);
+            println!("Downloading model {} to {}", model, path.as_deref().unwrap_or(".models"));
+            match download_model(&model, custom_path) {
                 Ok(_) => println!("Model downloaded successfully."),
                 Err(e) => println!("Error downloading model: {}", e),
             }
