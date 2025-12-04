@@ -12,4 +12,5 @@ categories.workspace = true
 clap = { version = "4.5.53", features = ["derive"] }
 hudagents-local.workspace = true
 sysinfo = "0.37.2"
+reqwest = { workspace = true }
 whisper-rs = { workspace = true }

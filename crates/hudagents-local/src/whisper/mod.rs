@@ -10,6 +10,9 @@ pub enum HAWhisperError {
     ModelNotFound(String),
     InvalidModelName(String),
     ModelInitFailed(String),
+    HttpRequestFailed(reqwest::Error),
+    HttpStatus(reqwest::StatusCode),
+    IOError(std::io::Error),
 }
 
 impl Display for HAWhisperError {
@@ -23,6 +26,9 @@ impl Display for HAWhisperError {
             ),
             HAWhisperError::InvalidModelName(model) => write!(f, "Invalid model name: {}", model),
             HAWhisperError::ModelInitFailed(msg) => write!(f, "Failed to initialize Whisper context: {}", msg),
+            HAWhisperError::HttpRequestFailed(msg) => write!(f, "HTTP request failed: {}", msg),
+            HAWhisperError::HttpStatus(status) => write!(f, "HTTP status: {}", status.as_u16()),
+            HAWhisperError::IOError(msg) => write!(f, "IO error: {}", msg),
         }
     }
 }

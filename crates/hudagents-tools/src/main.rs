@@ -1,11 +1,15 @@
 use clap::{Parser, Subcommand};
 use hudagents_local::whisper::HAWhisperError;
 use sysinfo::{System};
-use std::{path::Path, result::Result};
+use std::{
+    env,
+    fs::File,
+    io::copy,
+    path::{Path, PathBuf}, 
+    result::Result,
+};
 use whisper_rs::{print_system_info, SystemInfo};
 
-const MODEL_LOCATION_PATH: &str = "hudagents/.models";
-const DOWNLOAD_URL: &str = "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main/ggml";
 const AVAILABLE_MODELS: &[&str] = &[
     "tiny", "tiny.en", "tiny-q5_1", "tiny.en-q5_1", "tiny-q8_0",
     "base", "base.en", "base-q5_1", "base.en-q5_1", "base-q8_0",
@@ -116,6 +120,35 @@ fn download_model(model: &str, custom_path: Option<&Path>) -> Result<(), HAWhisp
     if !AVAILABLE_MODELS.contains(&model) {
         return Err(HAWhisperError::InvalidModelName(model.to_string()));
     }
+    //TODO: Maybe in the future consider directories crate for multi platform support
+    let target_dir = match custom_path {
+        Some(path) => PathBuf::from(path),
+        None => {
+            if let Some(env_path) = env::var_os("HA_WHISPER_PATH") { PathBuf::from(env_path) }
+            else { PathBuf::from(".models") }
+        },
+    };
+    //TODO: If target_dir does not exist, create it
+    let filename = format!("{model}.bin");
+    let file_path = target_dir.join(&filename);
+    if file_path.exists() {
+        println!("Model {} already exists at {:?}. Skipping download.", model, file_path);
+        return Ok(());
+    }
+    let (base_url, prefix) = determine_download_url(model);
+    let url = format!("{base_url}/{prefix}-{model}.bin");
+    println!("Downloading model {} from '{}' ...", model, url);
+    println!("Saving to {:?}", file_path);
+    let mut response = reqwest::blocking::get(url).map_err(HAWhisperError::HttpRequestFailed)?;
+    if !response.status().is_success() { return Err(HAWhisperError::HttpStatus(response.status())); }
+    let mut dest_file = match File::create(&file_path) {
+        Ok(file) => file,
+        Err(e) => return Err(HAWhisperError::IOError(e)),
+    };
+    match copy(&mut response, &mut dest_file) {
+        Ok(_) => println!("Model downloaded successfully."),
+        Err(e) => return Err(HAWhisperError::IOError(e)),
+    }
     Ok(())
 }
 
@@ -128,6 +161,10 @@ fn main() {
         }   
         Commands::Download { model, path } => {
             println!("Downloading model {} to {}", model, path.unwrap_or_default());
+            match download_model("medium.en", None) {
+                Ok(_) => println!("Model downloaded successfully."),
+                Err(e) => println!("Error downloading model: {}", e),
+            }
         }
     }
 }

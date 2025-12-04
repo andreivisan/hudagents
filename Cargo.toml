@@ -13,4 +13,5 @@ categories = []
 
 [workspace.dependencies]
 hudagents-local = { path = "crates/hudagents-local" }
+reqwest = { version = "0.12", features = ["blocking"] }
 whisper-rs = { version = "0.15.1", features = ["metal"] }

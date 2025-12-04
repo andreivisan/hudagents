@@ -10,3 +10,4 @@ categories.workspace = true
 
 [dependencies]
 whisper-rs = { workspace = true }
+reqwest = { workspace = true }
