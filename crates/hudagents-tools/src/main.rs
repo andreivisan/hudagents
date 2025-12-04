@@ -10,6 +10,8 @@ use std::{
 };
 use whisper_rs::{print_system_info, SystemInfo};
 
+pub mod debug;
+
 const AVAILABLE_MODELS: &[&str] = &[
     "tiny", "tiny.en", "tiny-q5_1", "tiny.en-q5_1", "tiny-q8_0",
     "base", "base.en", "base-q5_1", "base.en-q5_1", "base-q8_0",
@@ -59,15 +61,14 @@ fn resolve_backend() -> Backend {
     }
 }
 
-// TODO: Use a DEBUG_LEVEL flag to control the verbosity of the output
 fn sysinfo() -> &'static str{
-    println!("--- Whisper System Info ---");
-    println!("{}", print_system_info());
+    debug!(2, "--- Whisper System Info ---");
+    debug!(2, "{}", print_system_info());
     
     let mut sys = System::new();
     sys.refresh_memory();
     let total_ram_gb = sys.total_memory() / 1024 / 1024 / 1024;
-    println!("Total RAM: {} GB", total_ram_gb);
+    debug!(2, "Total RAM: {} GB", total_ram_gb);
     let cpu_info = SystemInfo::default();
     println!("\n--- Recommendation ---");
     match resolve_backend() {
