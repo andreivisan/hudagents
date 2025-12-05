@@ -223,4 +223,16 @@ mod tests {
         let result = download_model("invalid-model-name", None);
         assert!(matches!(result, Err(HAWhisperError::InvalidModelName(_))));
     }
+
+    #[test]
+    fn test_download_model_with_custom_path() {
+        let custom_path = Path::new("./test_models");
+        let model_name = "tiny";
+        let result = download_model(model_name, Some(custom_path));
+        assert!(result.is_ok());
+        let model_file_path = custom_path.join(format!("{}.bin", model_name));
+        assert!(model_file_path.exists());
+        std::fs::remove_file(model_file_path).unwrap();
+        std::fs::remove_dir(custom_path).unwrap();
+    }
 }
