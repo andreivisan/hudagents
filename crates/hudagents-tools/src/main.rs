@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn test_download_model_with_custom_path() {
         let custom_path = Path::new("./test_models");
-        let model_name = "tiny";
+        let model_name = "tiny.en";
         let result = download_model(model_name, Some(custom_path));
         assert!(result.is_ok());
         let model_file_path = custom_path.join(format!("{}.bin", model_name));
