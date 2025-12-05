@@ -213,3 +213,14 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_download_model_invalid_model() {
+        let result = download_model("invalid-model-name", None);
+        assert!(matches!(result, Err(HAWhisperError::InvalidModelName(_))));
+    }
+}
