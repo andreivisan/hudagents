@@ -152,7 +152,7 @@ fn download_model(model: &str, custom_path: Option<&Path>) -> Result<(), HAWhisp
     if !AVAILABLE_MODELS.contains(&model) {
         return Err(HAWhisperError::InvalidModelName(model.to_string()));
     }
-    //TODO: Maybe in the future consider directories crate for multi platform support
+    // TODO: Maybe in the future consider directories crate for multi platform support
     let target_dir = match custom_path {
         Some(path) => PathBuf::from(path),
         None => {
