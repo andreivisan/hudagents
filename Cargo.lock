@@ -467,6 +467,10 @@ dependencies = [
 [[package]]
 name = "hudagents-core"
 version = "0.1.0"
+dependencies = [
+ "hudagents-local",
+ "whisper-rs",
+]
 
 [[package]]
 name = "hudagents-local"

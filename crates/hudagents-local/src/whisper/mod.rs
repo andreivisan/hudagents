@@ -1,6 +1,6 @@
 use std::{
-    fmt::{self, Display, Debug}, 
     error::Error,
+    fmt::{self, Debug, Display},
     path::Path,
 };
 use whisper_rs::{WhisperContext, WhisperContextParameters};
@@ -10,6 +10,7 @@ pub enum HAWhisperError {
     ModelNotFound(String),
     InvalidModelName(String),
     ModelInitFailed(String),
+    TranscriptionFailed(String),
     HttpRequestFailed(reqwest::Error),
     HttpStatus(reqwest::StatusCode),
     IOError(std::io::Error),
@@ -18,14 +19,20 @@ pub enum HAWhisperError {
 impl Display for HAWhisperError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HAWhisperError::ModelNotFound(path) => write!(f, 
+            HAWhisperError::ModelNotFound(path) => write!(
+                f,
                 "Model not found at: {}\n\
                 Use `hudagents-tools sysinfo` to get the recommended model for your system, or\n\
-                Use `hudagents-tools download --model <model> --path <path>` to download the model"
-                , path
+                Use `hudagents-tools download --model <model> --path <path>` to download the model",
+                path
             ),
             HAWhisperError::InvalidModelName(model) => write!(f, "Invalid model name: {}", model),
-            HAWhisperError::ModelInitFailed(msg) => write!(f, "Failed to initialize Whisper context: {}", msg),
+            HAWhisperError::ModelInitFailed(msg) => {
+                write!(f, "Failed to initialize Whisper context: {}", msg)
+            }
+            HAWhisperError::TranscriptionFailed(msg) => {
+                write!(f, "Transcription failed: {}", msg)
+            }
             HAWhisperError::HttpRequestFailed(msg) => write!(f, "HTTP request failed: {}", msg),
             HAWhisperError::HttpStatus(status) => write!(f, "HTTP status: {}", status.as_u16()),
             HAWhisperError::IOError(msg) => write!(f, "IO error: {}", msg),
@@ -40,23 +47,27 @@ impl Error for HAWhisperError {
 }
 
 pub struct HALocalWhisper {
-    whisper_ctx: WhisperContext,
+    pub whisper_ctx: WhisperContext,
 }
 
 impl Debug for HALocalWhisper {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let model_type = self.whisper_ctx
+        let model_type = self
+            .whisper_ctx
             .model_type_readable_str_lossy()
             .unwrap_or("unknown".into());
 
         f.debug_struct("HALocalWhisper")
             // Create a custom formatted string for the context field
-            .field("whisper_ctx", &format_args!(
-                "WhisperContext {{ model: {:?}, multilingual: {}, vocab: {} }}",
-                model_type,
-                self.whisper_ctx.is_multilingual(),
-                self.whisper_ctx.n_vocab()
-            ))
+            .field(
+                "whisper_ctx",
+                &format_args!(
+                    "WhisperContext {{ model: {:?}, multilingual: {}, vocab: {} }}",
+                    model_type,
+                    self.whisper_ctx.is_multilingual(),
+                    self.whisper_ctx.n_vocab()
+                ),
+            )
             .finish()
     }
 }
@@ -68,10 +79,13 @@ impl HALocalWhisper {
             return Err(HAWhisperError::ModelNotFound(path.display().to_string()));
         }
         let whisper_ctx = WhisperContext::new_with_params(
-            path.to_string_lossy().as_ref(), 
-            WhisperContextParameters::default()
-        ).map_err(|e| HAWhisperError::ModelInitFailed(format!("Error loading model at {:?}: {:?}", path, e)))?;
-        
+            path.to_string_lossy().as_ref(),
+            WhisperContextParameters::default(),
+        )
+        .map_err(|e| {
+            HAWhisperError::ModelInitFailed(format!("Error loading model at {:?}: {:?}", path, e))
+        })?;
+
         Ok(Self { whisper_ctx })
     }
 }
@@ -79,7 +93,7 @@ impl HALocalWhisper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{ File, remove_file };
+    use std::fs::{File, remove_file};
 
     #[test]
     fn test_new_fails_when_model_not_found() {
@@ -97,9 +111,11 @@ mod tests {
     #[test]
     fn test_new_fails_when_model_init_failed() {
         let dummy = "dummy_model.bin";
-        { File::create(dummy).unwrap(); }
+        {
+            File::create(dummy).unwrap();
+        }
         let result = HALocalWhisper::new(dummy);
-        
+
         assert!(result.is_err());
 
         match result {
