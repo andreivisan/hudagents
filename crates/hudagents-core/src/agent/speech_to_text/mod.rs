@@ -7,7 +7,9 @@ use whisper_rs::{FullParams, SamplingStrategy};
 
 pub type WhisperResult<T> = std::result::Result<T, HAWhisperError>;
 
-fn decode_m4a_from_bytes(input: &[u8]) -> io::Result<Vec<i16>> {
+// TODO: Use Thread Pool for ffmpeg decoding to improve performance on multiple requests
+// TODO: Check if ffpmeg is installed and return an error if not (check AI chat)
+fn decode_m4a_to_f32(input: &[u8]) -> io::Result<Vec<f32>> {
     let mut child = Command::new("ffmpeg")
         .args([
             "-i", "pipe:0", // stdin
@@ -17,30 +19,29 @@ fn decode_m4a_from_bytes(input: &[u8]) -> io::Result<Vec<i16>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    {
-        let stdin = child.stdin.as_mut().expect("Failed to open stdin - piped");
-        stdin.write_all(input)?;
-    }
-    let mut raw_output = Vec::new();
-    child
-        .stdout
-        .take()
-        .expect("Failed to open stdout - piped")
-        .read_to_end(&mut raw_output)?;
-    let samples = raw_output
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
-        .collect();
-    Ok(samples)
-}
 
-fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
+    child.stdin.as_mut().unwrap().write_all(input)?;
+    drop(child.stdin.take());
+
     let scale = 1.0f32 / 32768.0;
-    let mut out = Vec::with_capacity(samples.len());
-    for &s in samples {
-        out.push(s as f32 * scale);
+    let mut pcm_f32 = Vec::<f32>::new();
+    let mut buf = [0u8; 4096];
+    let mut stdout = child.stdout.take().unwrap();
+
+    loop {
+        let n = stdout.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for chunk in buf[..n].chunks_exact(2) {
+            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            pcm_f32.push(sample as f32 * scale);
+        }
     }
-    out
+
+    let _status = child.wait()?;
+
+    Ok(pcm_f32)
 }
 
 pub fn transcribe(model_path: &str, input: &[u8]) -> WhisperResult<String> {
@@ -52,8 +53,12 @@ pub fn transcribe(model_path: &str, input: &[u8]) -> WhisperResult<String> {
         .create_state()
         .map_err(|e| HAWhisperError::ModelInitFailed(format!("Error creating state: {:?}", e)))?;
 
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(1);
+    params.set_n_threads(n_threads as i32);
     params.set_translate(false);
     params.set_language(Some("en"));
     params.set_print_special(false);
@@ -61,12 +66,7 @@ pub fn transcribe(model_path: &str, input: &[u8]) -> WhisperResult<String> {
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
 
-    let pcm_samples = match decode_m4a_from_bytes(input) {
-        Ok(samples) => i16_to_f32(&samples),
-        Err(e) => {
-            return Err(HAWhisperError::IOError(e));
-        }
-    };
+    let pcm_samples = decode_m4a_to_f32(input).map_err(HAWhisperError::IOError)?;
 
     state.full(params, &pcm_samples).map_err(|e| {
         HAWhisperError::ModelInitFailed(format!("Error during transcription: {:?}", e))
