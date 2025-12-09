@@ -101,3 +101,41 @@ pub fn transcribe(model_path: &str, input: &[u8]) -> WhisperResult<String> {
     }
     Ok(transcript.trim().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{env, path::Path};
+
+    #[test]
+    fn test_decode_m4a_to_f32() {
+        let input_data = include_bytes!("test_data/good-m4a.m4a");
+        let result = decode_m4a_to_f32(input_data);
+        assert!(result.is_ok());
+        let pcm_f32 = result.unwrap();
+        assert!(!pcm_f32.is_empty());
+    }
+
+    #[test]
+    fn test_decode_m4a_to_f32_corrupt_input() {
+        let input_data = include_bytes!("test_data/bad-m4a.m4a");
+        let result = decode_m4a_to_f32(input_data);
+        assert!(result.is_err());
+    }
+
+    //TODO: set a flag or ignore for when a CI environment is used
+    #[test]
+    fn test_transcribe() {
+        let model_dir = env::var("HA_WHISPER_PATH").expect("HA_WHISPER_PATH must be set for tests");
+        let model_path = Path::new(&model_dir).join("medium.en.bin");
+        let model_path = model_path
+            .to_str()
+            .expect("Model path should be valid UTF-8");
+        let input_data = include_bytes!("test_data/good-m4a.m4a");
+        let result = transcribe(model_path, input_data);
+        assert!(result.is_ok());
+        let transcript = result.unwrap();
+        assert!(!transcript.is_empty());
+        println!("Transcript: {}", transcript);
+    }
+}
