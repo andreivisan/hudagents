@@ -11,6 +11,8 @@ pub enum HAWhisperError {
     InvalidModelName(String),
     ModelInitFailed(String),
     TranscriptionFailed(String),
+    MissingDependency(String),
+    DecodeFailed(String),
     HttpRequestFailed(reqwest::Error),
     HttpStatus(reqwest::StatusCode),
     IOError(std::io::Error),
@@ -33,10 +35,22 @@ impl Display for HAWhisperError {
             HAWhisperError::TranscriptionFailed(msg) => {
                 write!(f, "Transcription failed: {}", msg)
             }
+            HAWhisperError::MissingDependency(dep) => {
+                write!(f, "Missing dependency: {}. Please install it.", dep)
+            }
+            HAWhisperError::DecodeFailed(msg) => {
+                write!(f, "ffmpeg failed to decode input: {}", msg)
+            }
             HAWhisperError::HttpRequestFailed(msg) => write!(f, "HTTP request failed: {}", msg),
             HAWhisperError::HttpStatus(status) => write!(f, "HTTP status: {}", status.as_u16()),
             HAWhisperError::IOError(msg) => write!(f, "IO error: {}", msg),
         }
+    }
+}
+
+impl From<std::io::Error> for HAWhisperError {
+    fn from(e: std::io::Error) -> Self {
+        HAWhisperError::IOError(e)
     }
 }
 

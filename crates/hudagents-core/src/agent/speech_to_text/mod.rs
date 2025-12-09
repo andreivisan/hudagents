@@ -1,15 +1,28 @@
 pub use hudagents_local::whisper::{HALocalWhisper, HAWhisperError};
 use std::{
-    io::{self, Read, Write},
+    io::{Read, Write},
     process::{Command, Stdio},
 };
 use whisper_rs::{FullParams, SamplingStrategy};
 
 pub type WhisperResult<T> = std::result::Result<T, HAWhisperError>;
 
-// TODO: Use Thread Pool for ffmpeg decoding to improve performance on multiple requests
-// TODO: Check if ffpmeg is installed and return an error if not (check AI chat)
-fn decode_m4a_to_f32(input: &[u8]) -> io::Result<Vec<f32>> {
+fn ensure_ffmpeg_installed() -> Result<(), HAWhisperError> {
+    match Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err(HAWhisperError::MissingDependency(
+            "ffmpeg is not installed or not found in PATH".to_string(),
+        )),
+    }
+}
+
+// TODO: Use Thread Pool for ffmpeg decoding to improve performance on multiple
+fn decode_m4a_to_f32(input: &[u8]) -> WhisperResult<Vec<f32>> {
+    ensure_ffmpeg_installed()?;
     let mut child = Command::new("ffmpeg")
         .args([
             "-i", "pipe:0", // stdin
@@ -38,8 +51,12 @@ fn decode_m4a_to_f32(input: &[u8]) -> io::Result<Vec<f32>> {
             pcm_f32.push(sample as f32 * scale);
         }
     }
-
-    let _status = child.wait()?;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(HAWhisperError::DecodeFailed(
+            "ffmpeg failed to decode input".to_string(),
+        ));
+    }
 
     Ok(pcm_f32)
 }
@@ -66,7 +83,7 @@ pub fn transcribe(model_path: &str, input: &[u8]) -> WhisperResult<String> {
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
 
-    let pcm_samples = decode_m4a_to_f32(input).map_err(HAWhisperError::IOError)?;
+    let pcm_samples = decode_m4a_to_f32(input)?;
 
     state.full(params, &pcm_samples).map_err(|e| {
         HAWhisperError::ModelInitFailed(format!("Error during transcription: {:?}", e))
