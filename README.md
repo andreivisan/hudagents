@@ -25,3 +25,20 @@ For local AI agents documentation please see [Local Agents docs](https://github.
 
 ### Data model
 
+- `protobuf` will be used for message passing and graph structure.
+- `JSON` will be used for optional debug export or external logs.
+
+### Tooling & Visualisation
+
+- HudAgents will include introspection capabilities to trace and visualize the agent behaviors at different verbosity levels.
+- In practice, this means implementing a logging or debug flag (e.g. a GRAPH and DEBUG level) that, when enabled, outputs the internal decision graph or conversation trace to the console.
+- Besides logging, we might allow exporting the agent interaction graph (perhaps as a data structure or even a Graphviz diagram) at runtime when debugging.
+- Future versions will include a GUI for the user to visualise the Graph flow.
+- To make HudAgents user-friendly, a builder pattern for constructing agent graphs is preferred.
+
+### Failure handling
+
+- HudAgents will allow the user to configure how failures are handled, rather than baking in one policy.
+- This means exposing settings like: max retries, fallback actions, or human intervention triggers.
+- Built-in Error Recovery: On the framework side, we’ll incorporate some automatic error-handling capabilities so that common failures don’t always need human intervention. This will also include time-travel debugging, meaning the system can backtrack to a prior state if something goes wrong.
+
