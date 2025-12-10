@@ -469,6 +469,7 @@ name = "hudagents-core"
 version = "0.1.0"
 dependencies = [
  "hudagents-local",
+ "tokio",
  "whisper-rs",
 ]
 

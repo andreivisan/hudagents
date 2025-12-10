@@ -11,7 +11,8 @@ For local AI agents documentation please see [Local Agents docs](https://github.
 
 ### Runtime behavior
 
-1. `**LangGraph**` is using an explicit graph, `**AutoGen**` is using a conversation-driven model. We are using what is called a ***Super Optimal Suggested Graph***. We simply generate an optimal *default* `graph` of agents based on the user's initial query. The user has then the possibility to change the initial `graph`.
+1. **LangGraph** is using an explicit graph, **AutoGen** is using a conversation-driven model. 
+HudAgents builds a default task graph (suggested by an LLM ‘planner’ agent) from the user’s initial query. Users can then modify or extend this graph.
 
 2. Currently the only type of memory supported is `**Short-Term Memory**` using a `**Context Queue**`.
 
@@ -21,12 +22,17 @@ For local AI agents documentation please see [Local Agents docs](https://github.
 
 2. **Local vs Remote agents** - HudAgents will let use choose per agent whether to use a local model or a cloud service. That way the user has control over what data is shared and what stays local.
 
-3. Each agend in HudAgents can be designed as a modular component with a defined role.
+3. Each agent in HudAgents can be designed as a modular component with a defined role as one of the two:
+    - **Stateless tools** (pure functions: “transcribe this”, “detect objects”).
+    - **Stateful agents** (have memory, persona, internal goals).
 
 ### Data model
 
-- `protobuf` will be used for message passing and graph structure.
-- `JSON` will be used for optional debug export or external logs.
+Starting with future versions:
+    - `protobuf` will be used for message passing and graph structure.
+    - `JSON` will be used for optional debug export or external logs.
+
+Currently internal Rust structs will be used.
 
 ### Tooling & Visualisation
 
@@ -38,7 +44,8 @@ For local AI agents documentation please see [Local Agents docs](https://github.
 
 ### Failure handling
 
+- We will start with retry + configurable failure behavior.
 - HudAgents will allow the user to configure how failures are handled, rather than baking in one policy.
 - This means exposing settings like: max retries, fallback actions, or human intervention triggers.
-- Built-in Error Recovery: On the framework side, we’ll incorporate some automatic error-handling capabilities so that common failures don’t always need human intervention. This will also include time-travel debugging, meaning the system can backtrack to a prior state if something goes wrong.
+- Built-in Error Recovery: On the framework side, we’ll incorporate some automatic error-handling capabilities so that common failures don’t always need human intervention. In the future this will also include time-travel debugging, meaning the system can backtrack to a prior state if something goes wrong.
 
