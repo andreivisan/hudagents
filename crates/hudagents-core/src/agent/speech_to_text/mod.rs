@@ -1,3 +1,4 @@
+pub use crate::agent::{Agent, AgentInput, AgentOutput, HAAgentError};
 pub use hudagents_local::whisper::{HALocalWhisper, HAWhisperError};
 use std::{
     io::{Read, Write},
@@ -6,6 +7,31 @@ use std::{
 use whisper_rs::{FullParams, SamplingStrategy};
 
 pub type WhisperResult<T> = std::result::Result<T, HAWhisperError>;
+
+pub struct SpeechToTextAgent {
+    id: &'static str,
+    model_path: String,
+}
+
+impl Agent for SpeechToTextAgent {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn call(&self, agent_input: AgentInput) -> Result<AgentOutput, HAAgentError> {
+        match agent_input {
+            AgentInput::Audio(bytes) => {
+                let text = transcribe(&self.model_path, &bytes)?;
+                Ok(AgentOutput::AudioTranscription(text))
+            }
+            _ => Err(HAAgentError::AgentInputError("expected audio input".into())),
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!("SpeechToTextAgent({})", self.id)
+    }
+}
 
 fn ensure_ffmpeg_installed() -> Result<(), HAWhisperError> {
     match Command::new("ffmpeg")

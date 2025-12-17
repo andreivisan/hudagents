@@ -146,12 +146,21 @@ fn kahn_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AgentInput, AgentOutput, HAAgentError};
 
     struct TestAgent(&'static str);
 
     impl Agent for TestAgent {
         fn id(&self) -> &str {
             self.0
+        }
+
+        fn call(&self, _agent_input: AgentInput) -> Result<AgentOutput, HAAgentError> {
+            Ok(AgentOutput::FinalAnswer(String::new()))
+        }
+
+        fn describe(&self) -> String {
+            format!("TestAgent({})", self.0)
         }
     }
 
