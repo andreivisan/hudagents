@@ -142,3 +142,91 @@ fn kahn_layers(
     }
     Ok(layers)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestAgent(&'static str);
+
+    impl Agent for TestAgent {
+        fn id(&self) -> &str {
+            self.0
+        }
+    }
+
+    fn agent(id: &'static str) -> Arc<dyn Agent + Send + Sync> {
+        Arc::new(TestAgent(id))
+    }
+
+    #[test]
+    fn layers_chain() {
+        let mut b = GraphBuilder::new();
+        let a = b.add_node("A", agent("a"));
+        let c = b.add_node("C", agent("c"));
+        let d = b.add_node("D", agent("d"));
+
+        b.add_edge(a, c).unwrap();
+        b.add_edge(c, d).unwrap();
+
+        let g = b.build().unwrap();
+        assert_eq!(g.layers, vec![vec![a], vec![c], vec![d]]);
+    }
+
+    #[test]
+    fn layers_branch_and_merge() {
+        let mut b = GraphBuilder::new();
+        let a = b.add_node("A", agent("a"));
+        let b1 = b.add_node("B", agent("b"));
+        let c = b.add_node("C", agent("c"));
+        let d = b.add_node("D", agent("d"));
+
+        b.add_edge(a, b1).unwrap();
+        b.add_edge(a, c).unwrap();
+        b.add_edge(b1, d).unwrap();
+        b.add_edge(c, d).unwrap();
+
+        let g = b.build().unwrap();
+        assert_eq!(g.layers, vec![vec![a], vec![b1, c], vec![d]]);
+    }
+
+    #[test]
+    fn layers_two_independent_chains() {
+        let mut b = GraphBuilder::new();
+        let a = b.add_node("A", agent("a"));
+        let b1 = b.add_node("B", agent("b"));
+        let c = b.add_node("C", agent("c"));
+        let d = b.add_node("D", agent("d"));
+
+        b.add_edge(a, c).unwrap();
+        b.add_edge(b1, d).unwrap();
+
+        let g = b.build().unwrap();
+        assert_eq!(g.layers, vec![vec![a, b1], vec![c, d]]);
+    }
+
+    #[test]
+    fn build_detects_cycle() {
+        let mut b = GraphBuilder::new();
+        let a = b.add_node("A", agent("a"));
+        let b1 = b.add_node("B", agent("b"));
+
+        b.add_edge(a, b1).unwrap();
+        b.add_edge(b1, a).unwrap();
+
+        match b.build() {
+            Err(err) => assert!(matches!(err, HAGraphError::CycleDetected(_))),
+            Ok(_) => panic!("expected cycle error"),
+        }
+    }
+
+    #[test]
+    fn add_edge_rejects_invalid_node_id() {
+        let mut b = GraphBuilder::new();
+        let a = b.add_node("A", agent("a"));
+        let bogus = NodeId(999);
+
+        let err = b.add_edge(a, bogus).unwrap_err();
+        assert!(matches!(err, HAGraphError::InvalidNodeId(_)));
+    }
+}
