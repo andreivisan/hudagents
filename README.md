@@ -51,4 +51,4 @@ Currently internal Rust structs will be used.
 
 ## Future Versions
 
-- Google's Pregel algorithm to support vertex parallel execution and support cycles. At the moment we are using Kahn's algorithm for parallel processing as no loops are supported at the moment.
+- Google's Pregel algorithm to support vertex parallel execution and support cycles. At the moment we are using Kahn's algorithm for parallel processing as no loops are supported at the moment. (Or maybe just use explicit loop constructs).

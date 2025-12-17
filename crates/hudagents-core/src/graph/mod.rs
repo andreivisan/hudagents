@@ -1,3 +1,4 @@
+use crate::agent::Agent;
 use std::{
     collections::VecDeque,
     fmt::{self, Debug, Display},
@@ -8,28 +9,21 @@ use std::{
 pub enum HAGraphError {
     CycleDetected(String),
     InvalidGraph(String),
+    InvalidNodeId(String),
 }
 
 impl Display for HAGraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HAGraphError::CycleDetected(msg) => {
-                write!(f, "cycle detected (not a DAG): {}", msg)
-            }
+            HAGraphError::CycleDetected(msg) => write!(f, "cycle detected (not a DAG): {}", msg),
             HAGraphError::InvalidGraph(msg) => write!(f, "invalid graph: {}", msg),
+            HAGraphError::InvalidNodeId(msg) => write!(f, "invalid node id: {}", msg),
         }
     }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct NodeId(pub usize);
-
-// TODO: Move this Agent into the agent module
-pub trait Agent {
-    fn id(&self) -> &str;
-    // fn call(&self, AgentIntput) -> Result<AgentOutput, AgentError>;
-    // fn describe(&self) -> String;
-}
 
 pub struct Node {
     pub name: String,
@@ -72,9 +66,17 @@ impl GraphBuilder {
         id
     }
 
-    pub fn add_edge(&mut self, from: NodeId, to: NodeId) {
+    pub fn add_edge(&mut self, from: NodeId, to: NodeId) -> Result<(), HAGraphError> {
+        let n = self.nodes.len();
+        if from.0 >= n || to.0 >= n {
+            return Err(HAGraphError::InvalidNodeId(format!(
+                "Invalid edge: from={} to={} (node count={})",
+                from.0, to.0, n
+            )));
+        }
         self.out[from.0].push(to);
         self.indegree[to.0] += 1;
+        Ok(())
     }
 
     pub fn build(self) -> Result<Graph, HAGraphError> {
@@ -97,10 +99,10 @@ fn kahn_layers(
     }
 
     let mut indegree = indegree.to_vec();
-    let mut q: VecDeque<usize> = VecDeque::new();
+    let mut q: VecDeque<NodeId> = VecDeque::new();
     for node_id in 0..n {
         if indegree[node_id] == 0 {
-            q.push_back(node_id)
+            q.push_back(NodeId(node_id))
         }
     }
     let mut layers: Vec<Vec<NodeId>> = Vec::new();
@@ -111,17 +113,22 @@ fn kahn_layers(
         for _ in 0..layer_size {
             let node = q.pop_front().unwrap();
             seen += 1;
-            layer.push(NodeId(node));
-            for &next in &out[node] {
+            layer.push(node);
+            for &next in &out[node.0] {
                 let next_i = next.0;
                 if next_i >= n {
                     return Err(HAGraphError::InvalidGraph(format!(
                         "edge points to missing node index {next_i}"
                     )));
                 }
+                if indegree[next_i] == 0 {
+                    return Err(HAGraphError::InvalidGraph(format!(
+                        "indegree underflow at node {next_i}"
+                    )));
+                }
                 indegree[next_i] -= 1;
                 if indegree[next_i] == 0 {
-                    q.push_back(next_i);
+                    q.push_back(NodeId(next_i));
                 }
             }
         }
