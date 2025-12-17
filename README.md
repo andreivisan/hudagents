@@ -49,3 +49,6 @@ Currently internal Rust structs will be used.
 - This means exposing settings like: max retries, fallback actions, or human intervention triggers.
 - Built-in Error Recovery: On the framework side, we’ll incorporate some automatic error-handling capabilities so that common failures don’t always need human intervention. In the future this will also include time-travel debugging, meaning the system can backtrack to a prior state if something goes wrong.
 
+## Future Versions
+
+- Google's Pregel algorithm to support vertex parallel execution and support cycles. At the moment we are using Kahn's algorithm for parallel processing as no loops are supported at the moment.
