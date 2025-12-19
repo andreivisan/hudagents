@@ -12,3 +12,7 @@ categories.workspace = true
 hudagents-local = { workspace = true }
 tokio = { workspace = true }
 whisper-rs = { workspace = true }
+
+[features]
+default = []
+heavy_tests = []

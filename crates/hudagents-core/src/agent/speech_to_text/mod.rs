@@ -1,35 +1,51 @@
-pub use crate::agent::{Agent, AgentInput, AgentOutput, HAAgentError};
+pub use super::{Agent, AgentInput, AgentOutput, HAAgentError};
 pub use hudagents_local::whisper::{HALocalWhisper, HAWhisperError};
 use std::{
+    borrow::Cow,
     io::{Read, Write},
     process::{Command, Stdio},
+    sync::OnceLock,
 };
-use whisper_rs::{FullParams, SamplingStrategy};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext};
 
 pub type WhisperResult<T> = std::result::Result<T, HAWhisperError>;
 
+static FFMPEG_CHECK: OnceLock<Result<(), String>> = OnceLock::new();
+
 pub struct SpeechToTextAgent {
-    id: &'static str,
-    model_path: String,
+    id: Cow<'static, str>,
+    whisper_context: WhisperContext,
+}
+
+impl SpeechToTextAgent {
+    pub fn new(
+        id: impl Into<Cow<'static, str>>,
+        model_path: impl Into<String>,
+    ) -> Result<Self, HAAgentError> {
+        ensure_ffmpeg_installed_once()?;
+        let whisper_context = HALocalWhisper::new(model_path.into())?.whisper_ctx;
+        Ok(Self {
+            id: id.into(),
+            whisper_context,
+        })
+    }
 }
 
 impl Agent for SpeechToTextAgent {
     fn id(&self) -> &str {
-        self.id
+        self.id.as_ref()
     }
 
+    // TODO: Use Tokio type calls to make this non blocking
+    // Also for the transcribe method
     fn call(&self, agent_input: AgentInput) -> Result<AgentOutput, HAAgentError> {
         match agent_input {
             AgentInput::Audio(bytes) => {
-                let text = transcribe(&self.model_path, &bytes)?;
+                let text = transcribe(&bytes, &self.whisper_context)?;
                 Ok(AgentOutput::AudioTranscription(text))
             }
-            _ => Err(HAAgentError::AgentInputError("expected audio input".into())),
+            _ => Err(HAAgentError::InvalidInput("expected audio input".into())),
         }
-    }
-
-    fn describe(&self) -> String {
-        format!("SpeechToTextAgent({})", self.id)
     }
 }
 
@@ -46,9 +62,17 @@ fn ensure_ffmpeg_installed() -> Result<(), HAWhisperError> {
     }
 }
 
+fn ensure_ffmpeg_installed_once() -> Result<(), HAWhisperError> {
+    let result = FFMPEG_CHECK.get_or_init(|| ensure_ffmpeg_installed().map_err(|e| e.to_string()));
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(msg) => Err(HAWhisperError::MissingDependency(msg.clone())),
+    }
+}
+
 // TODO: Use Thread Pool for ffmpeg decoding to improve performance on multiple
 fn decode_m4a_to_f32(input: &[u8]) -> WhisperResult<Vec<f32>> {
-    ensure_ffmpeg_installed()?;
     let mut child = Command::new("ffmpeg")
         .args([
             "-i", "pipe:0", // stdin
@@ -63,6 +87,8 @@ fn decode_m4a_to_f32(input: &[u8]) -> WhisperResult<Vec<f32>> {
     drop(child.stdin.take());
 
     let scale = 1.0f32 / 32768.0;
+    // TODO: Perf improvement - find out the size first of the samples
+    // and allocate only as needed otherwise each push will reallocate
     let mut pcm_f32 = Vec::<f32>::new();
     let mut buf = [0u8; 4096];
     let mut stdout = child.stdout.take().unwrap();
@@ -87,11 +113,7 @@ fn decode_m4a_to_f32(input: &[u8]) -> WhisperResult<Vec<f32>> {
     Ok(pcm_f32)
 }
 
-pub fn transcribe(model_path: &str, input: &[u8]) -> WhisperResult<String> {
-    let whisper_ctx = match HALocalWhisper::new(model_path) {
-        Ok(ctx) => ctx.whisper_ctx,
-        Err(e) => return Err(e),
-    };
+pub fn transcribe(input: &[u8], whisper_ctx: &WhisperContext) -> WhisperResult<String> {
     let mut state = whisper_ctx
         .create_state()
         .map_err(|e| HAWhisperError::ModelInitFailed(format!("Error creating state: {:?}", e)))?;
@@ -195,7 +217,6 @@ fn rewrite_wake_word(transcript: &str, wake_word: &str, max_distance: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, path::Path};
 
     #[test]
     fn test_decode_m4a_to_f32() {
@@ -219,18 +240,23 @@ mod tests {
         assert_eq!(dist, 2);
     }
 
-    // TODO: set a flag or ignore for when a CI environment is used
     #[test]
+    #[cfg(feature = "heavy_tests")]
     fn test_transcribe() {
-        let model_dir = env::var("HA_WHISPER_PATH").expect("HA_WHISPER_PATH must be set for tests");
+        use std::{env, path::Path};
+        let model_dir = match env::var("HA_WHISPER_PATH") {
+            Ok(dir) => dir,
+            Err(_) => {
+                eprintln!("Skipping test_transcribe: HA_WHISPER_PATH is not set");
+                return;
+            }
+        };
         let model_path = Path::new(&model_dir).join("medium.en.bin");
-        let model_path = model_path
-            .to_str()
-            .expect("Model path should be valid UTF-8");
+        let whisper = HALocalWhisper::new(&model_path)
+            .expect("Model should be available when HA_WHISPER_PATH is set");
         let input_data = include_bytes!("test_data/good-m4a.m4a");
-        let result = transcribe(model_path, input_data);
-        assert!(result.is_ok());
-        let transcript = result.unwrap();
+        let transcript = transcribe(input_data, &whisper.whisper_ctx)
+            .expect("transcription should succeed with test audio");
         assert!(!transcript.is_empty());
         println!("Transcript: {}", transcript);
     }
