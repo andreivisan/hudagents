@@ -2,6 +2,17 @@
 
 Most beautifuly and efficiently written AI Agents Framework centered around Computer Vision.
 
+## Principles
+
+My development for hardware and software has the following MUSTS:
+- minimal dependencies for memory efficiency (like we said above if it takes too much code we will use dependencies)
+- elegant with as little as possible code to solve problems
+- speed is vital
+- security is vital
+- 0 bugs is vital
+- privacy is vital
+- beauty is essential
+
 ## Privacy first
 
 In order to protect user's privacy this framework support local AI Agents as well as Cloud AI Agents.
