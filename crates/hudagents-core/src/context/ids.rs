@@ -1,5 +1,8 @@
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct UserId(pub String);
+pub struct RunId(pub u64);
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct UserId(pub usize);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct DeviceId(pub String);

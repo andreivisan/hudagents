@@ -63,3 +63,5 @@ Currently internal Rust structs will be used.
 ## Future Versions
 
 - Google's Pregel algorithm to support vertex parallel execution and support cycles. At the moment we are using Kahn's algorithm for parallel processing as no loops are supported at the moment. (Or maybe just use explicit loop constructs).
+- Pre-processed flows based on functionality: for example an agentic flow optimised for coding, another one for studying.
+- Pre-processed flows based on vendor: flows that are using the OpenAI ecosystem, or Anthropic, or just a gathering of the best open source AI agents. 

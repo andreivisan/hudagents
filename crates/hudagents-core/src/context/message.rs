@@ -1,20 +1,29 @@
-use super::ids::AgentId;
-use crate::agent::{AgentInput, AgentOutput};
+use super::blob::BlobRef;
+use super::ids::RunId;
+use super::runtime::Control;
+use crate::graph::NodeId;
 
 #[derive(Clone, Debug)]
 pub enum Sender {
     User,
-    Agent(AgentId),
+    Node(NodeId),
+}
+
+#[derive(Clone, Debug)]
+pub enum MessagePayload {
+    Text(String),
+    Audio(BlobRef),
+    Image(BlobRef),
+    Transcription(String),
+    VisionCaption(String),
+    FinalAnswer(String),
+    Control(Control),
+    Error(String),
 }
 
 #[derive(Clone, Debug)]
 pub struct AgentMessage {
+    pub run: RunId,
     pub from: Sender,
-    pub text: String,
-}
-
-pub enum MessagePayload {
-    Text(String),
-    Input(AgentInput),
-    Output(AgentOutput),
+    pub payload: MessagePayload,
 }
