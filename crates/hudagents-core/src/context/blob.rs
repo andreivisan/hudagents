@@ -1,7 +1,12 @@
 use std::sync::Arc;
 
+// Used to referebce Blob Object inside the Message Payload
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BlobRef(pub u64);
+
+// Used to store Blob objects inside the internal storage
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct BlobId(pub u64);
 
 #[derive(Clone, Debug)]
 pub struct Blob {

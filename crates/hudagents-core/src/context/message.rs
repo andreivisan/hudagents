@@ -1,6 +1,6 @@
+use super::Control;
 use super::blob::BlobRef;
 use super::ids::RunId;
-use super::runtime::Control;
 use crate::graph::NodeId;
 
 #[derive(Clone, Debug)]

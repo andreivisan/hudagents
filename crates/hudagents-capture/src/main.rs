@@ -9,18 +9,22 @@ const DEFAULT_OUTPUT_DIR: &str = "hudagents-capture/assets";
 const VIDEO_INPUT: &str = "AVFoundation video devices:";
 const AUDIO_INPUT: &str = "AVFoundation audio devices:";
 
-enum DeviceSection {None, Video, Audio}
+enum DeviceSection {
+    None,
+    Video,
+    Audio,
+}
 
 fn list_input_devices() -> std::io::Result<(Vec<String>, Vec<String>)> {
     let output = Command::new("ffmpeg")
         .args(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
         .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    
+
     let mut section = DeviceSection::None;
     let mut video_devices = Vec::new();
     let mut audio_devices = Vec::new();
-    
+
     for line in stderr.lines() {
         if line.contains(VIDEO_INPUT) {
             section = DeviceSection::Video;
@@ -34,7 +38,7 @@ fn list_input_devices() -> std::io::Result<(Vec<String>, Vec<String>)> {
             match section {
                 DeviceSection::Video => video_devices.push(line[idx + 1..].trim().to_owned()),
                 DeviceSection::Audio => audio_devices.push(line[idx + 1..].trim().to_owned()),
-                DeviceSection::None => {},
+                DeviceSection::None => {}
             }
         }
     }
@@ -51,22 +55,34 @@ fn capture_image_and_audio(duration: u64, session: &str, output_dir: &Path) {
     let input_device = "0:2";
     Command::new("ffmpeg")
         .args(&[
-            "-f", "avfoundation",
-            "-video_size", "1920x1080",
-            "-framerate", "30",
-            "-pixel_format", "uyvy422",
-            "-i", input_device,
+            "-f",
+            "avfoundation",
+            "-video_size",
+            "1920x1080",
+            "-framerate",
+            "30",
+            "-pixel_format",
+            "uyvy422",
+            "-i",
+            input_device,
             // --- OUTPUT 1: The Photo ---
-            "-map", "0:v",
-            "-frames:v", "1",
-            "-update", "1",
+            "-map",
+            "0:v",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
             "-y",
             photo_output_path.to_str().unwrap(),
             // --- OUTPUT 2: The Audio ---
-            "-map", "0:a",
-            "-t", &duration.to_string(),
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-map",
+            "0:a",
+            "-t",
+            &duration.to_string(),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
             "-y",
             audio_output_path.to_str().unwrap(),
         ])
@@ -89,12 +105,12 @@ fn main() {
     println!("Session: {}", args.session);
     println!("Duration: {} seconds", args.duration);
     println!("Output directory: {}", args.output_dir.display());
-    
+
     match list_input_devices() {
         Ok((video_devices, audio_devices)) => {
             println!("Available video input devices: {:?}", video_devices);
             println!("Available audio input devices: {:?}", audio_devices);
-        },
+        }
         Err(e) => eprintln!("Error listing video input devices: {}", e),
     };
 
