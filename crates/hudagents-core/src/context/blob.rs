@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-// Used to referebce Blob Object inside the Message Payload
+// Used to referebce Blob Object inside the Message Payloa
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BlobRef(pub u64);
 
@@ -13,3 +13,5 @@ pub struct Blob {
     pub bytes: Arc<[u8]>,
     pub mime: Option<&'static str>,
 }
+
+pub struct BlobStore {}
