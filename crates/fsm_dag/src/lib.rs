@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, usize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State { Locked, Unlocked }
@@ -43,16 +43,15 @@ fn step(state: State, event: Event, ctx: &mut Ctx) -> (State, Vec<Action>) {
     (state, actions)
 }
 
-fn run(init_state: State, init_events: Vec<Event>, max_steps: usize) -> (State, Ctx, Vec<Action>, bool) {
-    let mut q: VecDeque<Event> = init_events.into(); 
+fn run(init_state: State, init_events: &[Event], ctx: &mut Ctx, max_steps: usize) -> (State, Vec<Action>, bool) {
+    let mut q: VecDeque<Event> = init_events.iter().copied().collect(); 
     let mut state = init_state;
     let mut step_counter: usize = 0;
     let mut all_actions: Vec<Action> = Vec::new();
-    let mut ctx: Ctx = Ctx::default();
     while step_counter < max_steps {
         let Some(event) = q.pop_front() else { break;} ;
         step_counter += 1;
-        let (next_step, action_for_step) = step(state, event, &mut ctx);
+        let (next_step, action_for_step) = step(state, event, ctx);
         for action in &action_for_step {
             match action {
                 Action::EnqueueCoin => q.push_back(Event::Coin),
@@ -64,7 +63,64 @@ fn run(init_state: State, init_events: Vec<Event>, max_steps: usize) -> (State, 
         state = next_step;
     }
     let hit_cap: bool = step_counter == max_steps && !q.is_empty();
-    (state, ctx, all_actions, hit_cap) // last bool tells us if we hit max steps or not
+    (state, all_actions, hit_cap) // last bool tells us if we hit max steps or not
+}
+
+fn kahn(num_nodes: usize, edges: &[(usize, usize)]) -> Vec<usize> {
+    let mut result: Vec<usize> = Vec::with_capacity(num_nodes); 
+    let mut in_degree = vec![0; num_nodes];
+    let mut graph: Vec<Vec<usize>> = vec![Vec::new(); num_nodes]; 
+    // compute each node's in-degree
+    for &(origin, dest) in edges {
+        debug_assert!(origin < num_nodes && dest < num_nodes);
+        graph[origin].push(dest);
+        in_degree[dest] += 1;
+    }
+    let mut q: VecDeque<usize> = VecDeque::new();
+    for node in 0..num_nodes {
+        if in_degree[node] == 0 { q.push_back(node) } 
+    }
+    let mut processed = 0usize;
+    while let Some(node) = q.pop_front() {
+        processed += 1;
+        result.push(node);
+        for &next_node in &graph[node] {
+            in_degree[next_node] -= 1;
+            if in_degree[next_node] == 0 { q.push_back(next_node); }
+        }
+    }
+    if processed < num_nodes { vec![] }
+    else { result }
+}
+
+fn run_passes(
+  init_state: State,
+  num_nodes: usize,
+  edges: &[(usize, usize)],
+  max_passes: usize,
+  max_steps_per_pass: usize,
+) -> (State, Ctx, Vec<Action>) {
+    let mut state = init_state;
+    let mut ctx: Ctx = Ctx::default();
+    let mut all_actions: Vec<Action> = Vec::new();
+    let ordered: Vec<usize> = kahn(num_nodes, edges);
+    if ordered.is_empty() { return (state, Ctx::default(), vec![]); }
+    let mut events: Vec<Event> = Vec::new();
+    for _ in 0..max_passes {
+        events.clear();
+        for &node in &ordered {
+            match node {
+                0 => events.push(Event::Push),
+                2 => events.push(Event::Coin),
+                _ => {}
+            }
+        }
+        let (next_step, next_actions, _) = run(state, &events, &mut ctx, max_steps_per_pass);   
+        state = next_step;
+        all_actions.extend(next_actions);
+        if state == State::Unlocked { return (state, ctx, all_actions); }
+    }
+    (state, ctx, all_actions)
 }
 
 #[cfg(test)]
@@ -73,15 +129,12 @@ mod tests {
 
     #[test]
     fn test_multiple_events() {
-        // Create a vec of events
-        let events = vec![Event::Push, Event::Coin, Event::Push, Event::Coin];
+        let events = [Event::Push, Event::Coin, Event::Push, Event::Coin];
         let mut state = State::Locked;
         let mut actions: Vec<Action> = Vec::new();
         let mut ctx: Ctx = Ctx::default();
-        // Loop through the vec
         for event in events {
             let (next_state, temp_acc) = step(state, event, &mut ctx);
-            // Append actions for each event to an outer accumulator
             actions.extend(temp_acc);
             state = next_state;
         }
@@ -93,13 +146,36 @@ mod tests {
     #[test]
     fn test_run() {
         let init_state = State::Locked;
-        let init_events = vec![Event::Push];
+        let init_events = [Event::Push];
+        let mut ctx: Ctx = Ctx::default();
         let max_steps = 10;
-        let (state, ctx, all_actions, hit_cap) = run(init_state, init_events, max_steps);
+        let (state, all_actions, hit_cap) = run(init_state, &init_events, &mut ctx, max_steps);
         assert_eq!(state, State::Unlocked);
         assert_eq!(ctx, Ctx{ coins: 1, pushes: 1, alarms: 1 });
         assert_eq!(all_actions, vec![Action::Alarm, Action::EnqueueCoin, Action::Unlock]);
         assert_eq!(hit_cap, false);
+    }
+
+    #[test]
+    fn test_khan() {
+        let result: Vec<usize>  = kahn(4, &[(0, 2), (1, 2), (2, 3)]);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_khan_cycle() {
+        let result: Vec<usize>  = kahn(4, &[(0, 2), (1, 2), (2, 3), (3, 1)]);
+        assert_eq!(result, vec![]);
+    }
+
+    #[test]
+    fn test_run_passes() {
+        let num_nodes = 4;
+        let edges = [(0, 2), (1, 2), (2, 3)];
+        let (state, _, actions) = run_passes(State::Locked, num_nodes, &edges, 10, 10);
+        assert_eq!(state, State::Unlocked);
+        assert!(actions.iter().any(|a| matches!(a, Action::Unlock)));
     }
 
 }
