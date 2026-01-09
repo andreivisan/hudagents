@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State { Locked, Unlocked }
 
@@ -25,7 +27,7 @@ fn step(state: State, event: Event, ctx: &mut Ctx) -> (State, Vec<Action>) {
         (State::Locked, Event::Push) => {
             ctx.alarms += 1;
             ctx.pushes += 1;
-            return (State::Locked, vec![Action::Alarm])
+            return (State::Locked, vec![Action::Alarm, Action::EnqueueCoin])
         },
         (State::Unlocked, Event::Coin) => {
             ctx.coins += 1;
@@ -41,7 +43,28 @@ fn step(state: State, event: Event, ctx: &mut Ctx) -> (State, Vec<Action>) {
     (state, actions)
 }
 
-fn run(init_state: State, init_events: Vec<Event>, max_steps: usize) -> (State, Ctx, Vec<Action>) {}
+fn run(init_state: State, init_events: Vec<Event>, max_steps: usize) -> (State, Ctx, Vec<Action>, bool) {
+    let mut q: VecDeque<Event> = init_events.into(); 
+    let mut state = init_state;
+    let mut step_counter: usize = 0;
+    let mut all_actions: Vec<Action> = Vec::new();
+    let mut ctx: Ctx = Ctx::default();
+    while step_counter < max_steps {
+        step_counter += 1;
+        let Some(event) = q.pop_front() else { break;} ;
+        let (next_step, action_for_step) = step(init_state, event, &mut ctx);
+        for action in &action_for_step {
+            match action {
+                Action::EnqueueCoin => q.push_back(Event::Coin),
+                Action::EnqueuePush => q.push_back(Event::Push),
+                _ => {}
+            }
+        }
+        all_actions.extend(action_for_step);
+        state = next_step;
+    }
+    (state, ctx, all_actions, !q.is_empty()) // last bool tells us if we hit max steps or not
+}
 
 #[cfg(test)]
 mod tests {
@@ -63,7 +86,19 @@ mod tests {
         }
         assert_eq!(ctx, Ctx{ coins: 2, pushes: 2, alarms: 1 });
         assert_eq!(state, State::Unlocked);
-        assert_eq!(actions, vec![Action::Alarm, Action::Unlock, Action::Lock, Action::Unlock]);
+        assert_eq!(actions, vec![Action::Alarm, Action::EnqueueCoin, Action::Unlock, Action::Lock, Action::Unlock]);
+    }
+
+    #[test]
+    fn test_run() {
+        let init_state = State::Locked;
+        let init_events = vec![Event::Push];
+        let max_steps = 10;
+        let (state, ctx, all_actions, hit_cap) = run(init_state, init_events, max_steps);
+        assert_eq!(state, State::Unlocked);
+        assert_eq!(ctx, Ctx{ coins: 1, pushes: 1, alarms: 1 });
+        assert_eq!(all_actions, vec![Action::Alarm, Action::EnqueueCoin, Action::Unlock]);
+        assert_eq!(hit_cap, false);
     }
 
 }
