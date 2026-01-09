@@ -50,9 +50,9 @@ fn run(init_state: State, init_events: Vec<Event>, max_steps: usize) -> (State, 
     let mut all_actions: Vec<Action> = Vec::new();
     let mut ctx: Ctx = Ctx::default();
     while step_counter < max_steps {
-        step_counter += 1;
         let Some(event) = q.pop_front() else { break;} ;
-        let (next_step, action_for_step) = step(init_state, event, &mut ctx);
+        step_counter += 1;
+        let (next_step, action_for_step) = step(state, event, &mut ctx);
         for action in &action_for_step {
             match action {
                 Action::EnqueueCoin => q.push_back(Event::Coin),
@@ -63,7 +63,8 @@ fn run(init_state: State, init_events: Vec<Event>, max_steps: usize) -> (State, 
         all_actions.extend(action_for_step);
         state = next_step;
     }
-    (state, ctx, all_actions, !q.is_empty()) // last bool tells us if we hit max steps or not
+    let hit_cap: bool = step_counter == max_steps && !q.is_empty();
+    (state, ctx, all_actions, hit_cap) // last bool tells us if we hit max steps or not
 }
 
 #[cfg(test)]
