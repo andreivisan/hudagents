@@ -110,8 +110,16 @@ fn run_passes(
         events.clear();
         for &node in &ordered {
             match node {
-                0 => events.push(Event::Push),
-                2 => events.push(Event::Coin),
+                0 => {
+                    if state == State::Locked { events.push(Event::Push); }
+                },
+                2 => {
+                    if state == State::Locked {
+                        events.push(Event::Coin);
+                    } else if ctx.coins < 3 {
+                        events.push(Event::Coin);
+                    }
+                },
                 _ => {}
             }
         }
@@ -178,5 +186,14 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(a, Action::Unlock)));
     }
 
-}
+    #[test]
+    fn test_run_passes_unlocks_once_and_stops_pushing() {
+        let num_nodes = 4;
+        let edges = [(0, 2), (1, 2), (2, 3)];
+        let (state, ctx, _) = run_passes(State::Locked, num_nodes, &edges, 8, 10);
+        assert_eq!(state, State::Unlocked);
+        assert_eq!(ctx.pushes, 1);
+        assert!(ctx.coins <= 3);
+    }
 
+}
