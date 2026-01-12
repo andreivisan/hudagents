@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, usize};
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State { Locked, Unlocked }
@@ -128,7 +128,7 @@ fn run_passes(
     let mut all_actions: Vec<Action> = Vec::new();
     let ordered: Vec<usize> = kahn(num_nodes, edges);
     if ordered.is_empty() { return (state, Ctx::default(), vec![]); }
-    let mut events: Vec<Event> = Vec::new();
+    let mut events: Vec<Event> = Vec::with_capacity(num_nodes);
     let enabled: Vec<Cond> = vec![
         Cond::StateIs(State::Locked),
         Cond::Always,
