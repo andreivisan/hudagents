@@ -45,6 +45,15 @@ Starting with future versions:
 
 Currently internal Rust structs will be used.
 
+### Orchestration
+
+- Using a DAG implementing Khan's algorithm to decided the order of execution and parallelism.
+- Using a FSM to create cycles of execution in a DAG.
+- Using a modified Actor Model for messaging between agents:
+    1. Task-Handle split with Message enums to define the "protocol" of interaction.
+    2. Bounded Mailboxes and Backpressure to support heavy load.
+    3. Group chat and Manager Actors: Round-Robin for local models (to still have speed) and LLM-based selector for the cloud option.
+
 ### Tooling & Visualisation
 
 - HudAgents will include introspection capabilities to trace and visualize the agent behaviors at different verbosity levels.
