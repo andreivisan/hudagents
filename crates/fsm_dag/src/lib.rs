@@ -16,6 +16,29 @@ struct Ctx {
     alarms: u32,
 }
 
+#[derive(Clone, Debug)]
+enum Cond {
+    Always,
+    StateIs(State),
+    CoinsLt(u32),
+    And(Box<Cond>, Box<Cond>),
+    Or(Box<Cond>, Box<Cond>),
+    Not(Box<Cond>)
+}
+
+impl Cond {
+    fn eval(&self, state: State, ctx: &Ctx) -> bool {
+        match self {
+            Cond::Always => true,
+            Cond::StateIs(s) => state == *s,
+            Cond::CoinsLt(n) => ctx.coins < *n,
+            Cond::And(a, b) => a.eval(state, ctx) && b.eval(state, ctx),
+            Cond::Or(a, b) => a.eval(state, ctx) || b.eval(state, ctx),
+            Cond::Not(a) => !a.eval(state, ctx)
+        } 
+    }
+}
+
 fn step(state: State, event: Event, ctx: &mut Ctx) -> (State, Vec<Action>) {
     let mut actions = Vec::new();
     let state: State  = match (state, event) {
@@ -106,21 +129,21 @@ fn run_passes(
     let ordered: Vec<usize> = kahn(num_nodes, edges);
     if ordered.is_empty() { return (state, Ctx::default(), vec![]); }
     let mut events: Vec<Event> = Vec::new();
+    let enabled: Vec<Cond> = vec![
+        Cond::StateIs(State::Locked),
+        Cond::Always,
+        Cond::Or(Box::new(Cond::StateIs(State::Locked)), Box::new(Cond::CoinsLt(3))),
+        Cond::StateIs(State::Unlocked)
+    ];
     for _ in 0..max_passes {
         events.clear();
         for &node in &ordered {
-            match node {
-                0 => {
-                    if state == State::Locked { events.push(Event::Push); }
-                },
-                2 => {
-                    if state == State::Locked {
-                        events.push(Event::Coin);
-                    } else if ctx.coins < 3 {
-                        events.push(Event::Coin);
-                    }
-                },
-                _ => {}
+            if enabled[node].eval(state, &ctx) {
+                match node {
+                    0 => events.push(Event::Push),
+                    2 => events.push(Event::Coin),
+                    _ => {}
+                }
             }
         }
         let (next_step, next_actions, _) = run(state, &events, &mut ctx, max_steps_per_pass);   
@@ -194,6 +217,16 @@ mod tests {
         assert_eq!(state, State::Unlocked);
         assert_eq!(ctx.pushes, 1);
         assert!(ctx.coins <= 3);
+    }
+
+    #[test]
+    fn test_run_conditional_edges() {
+        let num_nodes = 4;
+        let edges = [(0, 2), (1, 2), (2, 3)];
+        let (state, ctx, _) = run_passes(State::Locked, num_nodes, &edges, 8, 10);
+        assert_eq!(state, State::Unlocked);
+        assert_eq!(ctx.pushes, 1);
+        assert_eq!(ctx.coins, 2);
     }
 
 }
