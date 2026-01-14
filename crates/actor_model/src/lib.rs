@@ -1,7 +1,7 @@
 use tokio::{
     sync::{
-        oneshot::Sender,
-        mpsc::{Receiver, Sender as MpscSender}
+        mpsc::{channel, Receiver, Sender as MpscSender},
+        oneshot::{self, Sender},
     },
     task::JoinHandle
 };
@@ -13,21 +13,26 @@ pub enum ActorError {
 }
 
 enum Message {
-    Add { delta: i64, reply: Sender },
+    Add { delta: i64, reply: Sender<i64> },
     Get { reply: Sender<i64> },
-    Stop,
+    Stop { reply: Sender<()> },
 }
 
 pub struct CounterActor {
     count: i64,
-    rx: Receiver,
+    rx: Receiver<Message>,
 }
 
 impl CounterActor {
     async fn run(mut self) {
-        while let Some(msg) = self.rx.recv() await {
+        while let Some(msg) = self.rx.recv().await {
             match msg {
-                M
+                Message::Add { delta, reply } => {
+                    self.count += delta;
+                    let _ = reply.send(self.count);
+                }
+                Message::Get { reply } => { let _ = reply.send(self.count); }
+                Message::Stop { reply } => { let _ = reply.send(()); break; }
             }
         }
     }
@@ -38,46 +43,34 @@ pub struct CounterHandle {
     tx: MpscSender<Message>, 
 }
 
-pub fn spawn_counter(counter: usize) -> (CounterHandle, JoinHandle<()>) {
-    let (tx, rx) = oneshot::channel();
+impl CounterHandle {
+    async fn request<T>(
+        &self, 
+        make_msg: impl FnOnce(oneshot::Sender<T>) -> Message
+    ) -> Result<T, ActorError> {
+        let (reply_tx,  reply_rx) = oneshot::channel();
+        let msg = make_msg(reply_tx);
+        self.tx.send(msg).await.map_err(|_| ActorError::SendFailed)?;
+        reply_rx.await.map_err(|_| ActorError::ResponseDropped)
+    } 
+
+    pub async fn add(&self, delta: i64) -> Result<i64, ActorError> {
+        self.request(|reply| Message::Add { delta, reply }).await
+    }
+
+    pub async fn get(&self) -> Result<i64, ActorError> {
+        self.request(|reply| Message::Get { reply }).await
+    }
+
+    pub async fn stop(&self) -> Result<(), ActorError> {
+        self.request(|reply| Message::Stop { reply }).await
+    }
 }
 
-
-// use tokio::sync::mpsc;
-//
-//   struct CounterActor {
-//       count: i64,
-//       rx: mpsc::Receiver<Msg>,
-//   }
-//
-//   impl CounterActor {
-//       async fn run(mut self) {
-//           while let Some(msg) = self.rx.recv().await {
-//               match msg {
-//                   Msg::Add { delta, reply } => {
-//                       self.count += delta;
-//                       let _ = reply.send(self.count);
-//                   }
-//                   Msg::Get { reply } => {
-//                       let _ = reply.send(self.count);
-//                   }
-//                   Msg::Stop { reply } => {
-//                       let _ = reply.send(());
-//                       break;
-//                   }
-//               }
-//           }
-//       }
-//   }
-//
-//   And the spawn flow (still just a sketch):
-//
-//   pub fn spawn_counter(capacity: usize) -> (CounterHandle, JoinHandle<()>) {
-//       let (tx, rx) = mpsc::channel::<Msg>(capacity);
-//       let actor = CounterActor { count: 0, rx };
-//
-//       let join = tokio::spawn(actor.run());
-//       let handle = CounterHandle { tx };
-//
-//       (handle, join)
-//   }
+pub fn spawn_counter(capacity: usize) -> (CounterHandle, JoinHandle<()>) {
+    let (tx, rx) = channel::<Message>(capacity);
+    let actor = CounterActor { count: 0, rx };
+    let join = tokio::spawn(actor.run());
+    let handle = CounterHandle { tx };
+    (handle, join)
+}
