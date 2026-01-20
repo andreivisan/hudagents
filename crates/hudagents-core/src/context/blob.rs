@@ -14,4 +14,4 @@ pub struct Blob {
     pub mime: Option<&'static str>,
 }
 
-pub struct BlobStore {}
+pub trait BlobStore {}

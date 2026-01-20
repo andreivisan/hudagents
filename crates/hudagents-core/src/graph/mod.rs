@@ -30,6 +30,11 @@ pub struct Node {
     pub worker: Arc<dyn Agent + Send + Sync>,
 }
 
+pub struct Edge {
+    pub from: String,
+    pub to: String,
+}
+
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub out: Vec<Vec<NodeId>>,
