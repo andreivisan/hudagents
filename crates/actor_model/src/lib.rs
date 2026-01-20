@@ -19,7 +19,7 @@ pub enum ActorCtrl {
     Stop,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ExitReason {
     StoppedByMessage,
     AllSendersDropped,
@@ -166,5 +166,25 @@ mod tests {
         assert_eq!(v5, 4);
 
         let _ = handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_exits_with_stop_by_message() {
+        let (handle, join) = spawn_counter(8);
+        let _ = handle.stop().await;
+        let exit = join.await.expect("Actor task panicked");
+        assert_eq!(exit, ExitReason::StoppedByMessage);
+    }
+
+    #[tokio::test]
+    async fn test_exits_with_all_senders_dropped() {
+        let (handle, join) = spawn_counter(8);
+        let handle2 = handle.clone();
+
+        drop(handle);
+        drop(handle2);
+
+        let exit = join.await.expect("actor task panicked");
+        assert_eq!(exit, ExitReason::AllSendersDropped); 
     }
 }
