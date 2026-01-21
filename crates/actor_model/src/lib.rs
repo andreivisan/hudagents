@@ -7,8 +7,10 @@ use tokio::{
     task::JoinHandle
 };
 
+// === Generic actor runtime ===
 #[derive(Debug)]
 pub enum ActorError {
+    InvalidCapacity,
     SendFailed,
     ResponseDropped,
 }
@@ -25,52 +27,18 @@ pub enum ExitReason {
     AllSendersDropped,
 }
 
-enum Message {
-    Add { delta: i64, reply: ReplyTx<i64> },
-    Get { reply: ReplyTx<i64> },
-    Stop { reply: ReplyTx<()> },
-}
-
-#[derive(Clone)]
-pub struct CounterHandle {
-    tx: Sender<Message>, 
-}
-
-impl CounterHandle {
-    async fn request<T>(
-        &self, 
-        make_msg: impl FnOnce(ReplyTx<T>) -> Message
-    ) -> Result<T, ActorError> {
-        let (reply_tx,  reply_rx) = oneshot::channel();
-        let msg = make_msg(reply_tx);
-        self.tx.send(msg).await.map_err(|_| ActorError::SendFailed)?;
-        reply_rx.await.map_err(|_| ActorError::ResponseDropped)
-    } 
-
-    pub async fn add(&self, delta: i64) -> Result<i64, ActorError> {
-        self.request(|reply| Message::Add { delta, reply }).await
-    }
-
-    pub async fn get(&self) -> Result<i64, ActorError> {
-        self.request(|reply| Message::Get { reply }).await
-    }
-
-    pub async fn stop(&self) -> Result<(), ActorError> {
-        self.request(|reply| Message::Stop { reply }).await
-    }
-}
-
 pub fn spawn_actor<State, Msg, Handler, Fut>(
     capacity: usize,
     initial_state: State,
     handler: Handler
-) -> (Sender<Msg>, JoinHandle<ExitReason>)
+) -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError>
 where
     State: Send + 'static,
     Msg: Send + 'static,
     Handler: FnMut(&mut State, Msg) -> Fut + Send + 'static,
     Fut: Future<Output = ActorCtrl> + Send + 'static
 {
+    if capacity == 0 { return Err(ActorError::InvalidCapacity) }
     let (tx, mut rx) = channel::<Msg>(capacity);
     let join = tokio::spawn(async move {
         let mut state = initial_state;
@@ -83,7 +51,43 @@ where
         }
         ExitReason::AllSendersDropped
     });
-    (tx, join)
+    Ok((tx, join))
+}
+
+// === Counter example using the runtime ===
+enum CounterMessage {
+    Add { delta: i64, reply: ReplyTx<i64> },
+    Get { reply: ReplyTx<i64> },
+    Stop { reply: ReplyTx<()> },
+}
+
+#[derive(Clone)]
+pub struct CounterHandle {
+    tx: Sender<CounterMessage>, 
+}
+
+impl CounterHandle {
+    async fn request<T>(
+        &self, 
+        make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage
+    ) -> Result<T, ActorError> {
+        let (reply_tx,  reply_rx) = oneshot::channel();
+        let msg = make_msg(reply_tx);
+        self.tx.send(msg).await.map_err(|_| ActorError::SendFailed)?;
+        reply_rx.await.map_err(|_| ActorError::ResponseDropped)
+    } 
+
+    pub async fn add(&self, delta: i64) -> Result<i64, ActorError> {
+        self.request(|reply| CounterMessage::Add { delta, reply }).await
+    }
+
+    pub async fn get(&self) -> Result<i64, ActorError> {
+        self.request(|reply| CounterMessage::Get { reply }).await
+    }
+
+    pub async fn stop(&self) -> Result<(), ActorError> {
+        self.request(|reply| CounterMessage::Stop { reply }).await
+    }
 }
 
 
@@ -93,16 +97,16 @@ pub fn spawn_counter(capacity: usize) -> (CounterHandle, JoinHandle<ExitReason>)
         0_i64,
         |state, msg| {
             let ctrl = match msg {
-                Message::Add { delta, reply } => {
+                CounterMessage::Add { delta, reply } => {
                     *state += delta;
                     let _ = reply.send(*state);
                     ActorCtrl::Continue
                 }
-                Message::Get { reply } => {
+                CounterMessage::Get { reply } => {
                     let _ = reply.send(*state);
                     ActorCtrl::Continue
                 }
-                Message::Stop { reply } => {
+                CounterMessage::Stop { reply } => {
                     let _ = reply.send(());
                     ActorCtrl::Stop
                 }
@@ -110,7 +114,7 @@ pub fn spawn_counter(capacity: usize) -> (CounterHandle, JoinHandle<ExitReason>)
 
             async move { ctrl }
         },
-    );
+    ).expect("capacity must be > 0");
     (CounterHandle { tx }, join)
 }
 
