@@ -1,10 +1,12 @@
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 use tokio::{
     sync::{
         mpsc::{channel, Sender},
         oneshot::{self, Sender as ReplyTx},
+        RwLock,
     },
-    task::JoinHandle
+    task::JoinHandle,
+    time::{sleep, timeout, Duration},
 };
 
 // === Generic actor runtime ===
@@ -13,6 +15,7 @@ pub enum ActorError {
     InvalidCapacity,
     SendFailed,
     ResponseDropped,
+    Timeout,
 }
 
 #[derive(Debug)]
@@ -25,6 +28,58 @@ pub enum ActorCtrl {
 pub enum ExitReason {
     StoppedByMessage,
     AllSendersDropped,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RestartPolicy {
+    MaxRetries { n: usize },
+    Never,
+}
+
+// Helper function
+fn allows_restart(policy: RestartPolicy, attempts_so_far: usize) -> bool {
+    match policy {
+        RestartPolicy::MaxRetries{ n } => attempts_so_far < n,
+        RestartPolicy::Never => { false }
+    }
+}
+
+#[derive(Debug)]
+pub enum Termination {
+    Clean(ExitReason),
+    Panic,
+}
+
+struct Supervisor<Msg, F> 
+where
+    Msg: Send + 'static,
+    F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
+{
+    factory: F,
+    policy: RestartPolicy,
+    monitor_join: JoinHandle<()>,
+    restart_attempts: usize,
+    sender_slot: Arc<RwLock<Sender<Msg>>>,
+}
+
+#[derive(Clone)]
+struct SupervisorHandle<Msg>
+where
+    Msg: Send + 'static,
+{
+    sender_slot: Arc<RwLock<Sender<Msg>>>,
+}
+
+impl<Msg> SupervisorHandle<Msg> 
+where
+    Msg: Send + 'static
+{
+    async fn sender(&self) -> Sender<Msg> {
+        let guard = self.sender_slot.read().await;
+        let sender = guard.clone();
+        drop(guard);
+        sender
+    }
 }
 
 pub fn spawn_actor<State, Msg, Handler, Fut>(
@@ -55,15 +110,21 @@ where
 }
 
 // === Counter example using the runtime ===
+
+// Default timeout for actor requests (5s).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
 enum CounterMessage {
     Add { delta: i64, reply: ReplyTx<i64> },
     Get { reply: ReplyTx<i64> },
+    DelayGet { delay: Duration, reply: ReplyTx<i64> },
     Stop { reply: ReplyTx<()> },
 }
 
 #[derive(Clone)]
 pub struct CounterHandle {
     tx: Sender<CounterMessage>, 
+    default_timeout: Duration,
 }
 
 impl CounterHandle {
@@ -77,16 +138,41 @@ impl CounterHandle {
         reply_rx.await.map_err(|_| ActorError::ResponseDropped)
     } 
 
+    async fn request_with_timeout<T>(
+        &self, 
+        timeout_opt: Option<Duration>,
+        make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage
+    ) -> Result<T, ActorError> {
+        let fut = self.request(make_msg);
+        let effective_timeout = timeout_opt.unwrap_or(self.default_timeout);
+        match timeout(effective_timeout, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(ActorError::Timeout),
+        }
+    }
+
     pub async fn add(&self, delta: i64) -> Result<i64, ActorError> {
-        self.request(|reply| CounterMessage::Add { delta, reply }).await
+        self.request_with_timeout(None, |reply| CounterMessage::Add { delta, reply }).await
+    }
+
+    pub async fn add_with_timeout(&self, delta: i64, duration: Duration) -> Result<i64, ActorError> {
+        self.request_with_timeout(Some(duration), |reply| CounterMessage::Add { delta, reply }).await
     }
 
     pub async fn get(&self) -> Result<i64, ActorError> {
-        self.request(|reply| CounterMessage::Get { reply }).await
+        self.request_with_timeout(None, |reply| CounterMessage::Get { reply }).await
+    }
+
+    pub async fn get_with_timeout(&self, duration: Duration) -> Result<i64, ActorError> {
+        self.request_with_timeout(Some(duration), |reply| CounterMessage::Get { reply }).await
     }
 
     pub async fn stop(&self) -> Result<(), ActorError> {
-        self.request(|reply| CounterMessage::Stop { reply }).await
+        self.request_with_timeout(None, |reply| CounterMessage::Stop { reply }).await
+    }
+
+    pub async fn stop_with_timeout(&self, duration: Duration) -> Result<(), ActorError> {
+        self.request_with_timeout(Some(duration), |reply| CounterMessage::Stop { reply }).await
     }
 }
 
@@ -96,6 +182,8 @@ pub fn spawn_counter(capacity: usize) -> (CounterHandle, JoinHandle<ExitReason>)
         capacity,
         0_i64,
         |state, msg| {
+            let mut delayed: Option<(Duration, ReplyTx<i64>, i64)> = None;
+
             let ctrl = match msg {
                 CounterMessage::Add { delta, reply } => {
                     *state += delta;
@@ -106,16 +194,27 @@ pub fn spawn_counter(capacity: usize) -> (CounterHandle, JoinHandle<ExitReason>)
                     let _ = reply.send(*state);
                     ActorCtrl::Continue
                 }
+                CounterMessage::DelayGet { delay, reply } => {
+                    let value = *state;
+                    delayed = Some((delay, reply, value));
+                    ActorCtrl::Continue
+                }
                 CounterMessage::Stop { reply } => {
                     let _ = reply.send(());
                     ActorCtrl::Stop
                 }
             };
 
-            async move { ctrl }
+            async move {
+                if let Some((delay, reply, value)) = delayed {
+                    sleep(delay).await;
+                    let _ = reply.send(value);
+                }
+                ctrl
+            }
         },
     ).expect("capacity must be > 0");
-    (CounterHandle { tx }, join)
+    (CounterHandle { tx, default_timeout: DEFAULT_TIMEOUT }, join)
 }
 
 #[cfg(test)]
@@ -191,4 +290,28 @@ mod tests {
         let exit = join.await.expect("actor task panicked");
         assert_eq!(exit, ExitReason::AllSendersDropped); 
     }
+
+    #[tokio::test]
+    async fn test_override_path_works() {
+        let (handle, _join) = spawn_counter(8);
+        let v1 = handle.get_with_timeout(Duration::from_millis(50)).await.unwrap();
+        assert_eq!(v1, 0);
+        let _ = handle.stop().await;
+
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_timeout_triggered() {
+        let (handle, _join) = spawn_counter(8);
+
+        let fut = handle.request_with_timeout(
+            Some(Duration::from_millis(10)),
+            |reply| CounterMessage::DelayGet { delay: Duration::from_millis(50), reply },
+        );
+
+        tokio::time::advance(Duration::from_millis(11)).await;
+        let res = fut.await;
+        assert!(matches!(res, Err(ActorError::Timeout)));
+    }
 }
+

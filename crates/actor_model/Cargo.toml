@@ -9,4 +9,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["time", "test-util", "macros", "rt-multi-thread", "sync"] }
