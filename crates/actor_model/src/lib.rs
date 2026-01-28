@@ -62,6 +62,41 @@ where
     sender_slot: Arc<RwLock<Sender<Msg>>>,
 }
 
+impl<Msg, F> Supervisor<Msg, F>
+where
+    Msg: Send + 'static,
+    F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
+{
+    async fn monitor_loop(
+        factory: F, 
+        policy: RestartPolicy, 
+        sender_slot: Arc<RwLock<Sender<Msg>>>,
+        mut join: JoinHandle<ExitReason>
+    ) {
+        let mut attemtps = 0;
+        loop {
+            match join.await {
+                Ok(_exit) => { return; }
+                Err(err) => {
+                    if !err.is_panic() { return; }
+                    attemtps += 1;
+                    if !allows_restart(policy, attemtps) { return; } 
+                    let (new_tx, new_join) = match factory() {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    // swap sender
+                    {
+                        let mut slot = sender_slot.write().await;
+                        *slot = new_tx;
+                    }
+                    join = new_join;
+                }
+            }
+       }
+    }
+}
+
 #[derive(Clone)]
 struct SupervisorHandle<Msg>
 where
