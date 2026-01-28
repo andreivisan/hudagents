@@ -36,18 +36,19 @@ pub enum RestartPolicy {
     Never,
 }
 
+
+#[derive(Debug)]
+pub enum Termination {
+    Clean(ExitReason),
+    Panic,
+}
+
 // Helper function
 fn allows_restart(policy: RestartPolicy, attempts_so_far: usize) -> bool {
     match policy {
         RestartPolicy::MaxRetries{ n } => attempts_so_far < n,
         RestartPolicy::Never => { false }
     }
-}
-
-#[derive(Debug)]
-pub enum Termination {
-    Clean(ExitReason),
-    Panic,
 }
 
 struct Supervisor<Msg, F> 
@@ -62,7 +63,48 @@ where
     sender_slot: Arc<RwLock<Sender<Msg>>>,
 }
 
-#[derive(Clone)]
+impl<Msg, F> Supervisor<Msg, F>
+where
+    Msg: Send + 'static,
+    F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
+{
+    async fn monitor_loop(
+        factory: F, 
+        policy: RestartPolicy, 
+        sender_slot: Arc<RwLock<Sender<Msg>>>,
+        mut join: JoinHandle<ExitReason>
+    ) {
+        let mut attemtps = 0;
+        loop {
+            match join.await {
+                Ok(_exit) => { return; }
+                Err(err) => {
+                    if !err.is_panic() { return; }
+                    attemtps += 1;
+                    if !allows_restart(policy, attemtps) { return; } 
+                    let (new_tx, new_join) = match factory() {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    // swap sender
+                    {
+                        let mut slot = sender_slot.write().await;
+                        *slot = new_tx;
+                    }
+                    join = new_join;
+                }
+            }
+       }
+    }
+
+    async fn start(factory: F, policy: RestartPolicy) -> Result<SupervisorHandle<Msg>, ActorError> {
+        let (tx, join) = (factory)()?;
+        let sender_slot = Arc::new(RwLock::new(tx));
+        tokio::spawn(Self::monitor_loop(factory, policy, sender_slot.clone(), join)); 
+        Ok(SupervisorHandle { sender_slot })    
+    }
+}
+
 struct SupervisorHandle<Msg>
 where
     Msg: Send + 'static,
@@ -79,6 +121,17 @@ where
         let sender = guard.clone();
         drop(guard);
         sender
+    }
+}
+
+impl<Msg> Clone for SupervisorHandle<Msg>
+where
+    Msg: Send + 'static
+{
+    fn clone(&self) -> Self {
+        Self {
+            sender_slot: self.sender_slot.clone(),           
+        }
     }
 }
 
@@ -119,11 +172,12 @@ enum CounterMessage {
     Get { reply: ReplyTx<i64> },
     DelayGet { delay: Duration, reply: ReplyTx<i64> },
     Stop { reply: ReplyTx<()> },
+    CrashNow { reply: ReplyTx<()> },
 }
 
 #[derive(Clone)]
 pub struct CounterHandle {
-    tx: Sender<CounterMessage>, 
+    sup: SupervisorHandle<CounterMessage>,
     default_timeout: Duration,
 }
 
@@ -134,7 +188,8 @@ impl CounterHandle {
     ) -> Result<T, ActorError> {
         let (reply_tx,  reply_rx) = oneshot::channel();
         let msg = make_msg(reply_tx);
-        self.tx.send(msg).await.map_err(|_| ActorError::SendFailed)?;
+        let sender = self.sup.sender().await;
+        sender.send(msg).await.map_err(|_| ActorError::SendFailed)?;
         reply_rx.await.map_err(|_| ActorError::ResponseDropped)
     } 
 
@@ -174,47 +229,58 @@ impl CounterHandle {
     pub async fn stop_with_timeout(&self, duration: Duration) -> Result<(), ActorError> {
         self.request_with_timeout(Some(duration), |reply| CounterMessage::Stop { reply }).await
     }
+
+    pub async fn crash_now(&self) -> Result<(), ActorError> {
+        self.request_with_timeout(None, |reply| CounterMessage::CrashNow { reply }).await
+    }
 }
 
 
-pub fn spawn_counter(capacity: usize) -> (CounterHandle, JoinHandle<ExitReason>) {
-    let (tx, join) = spawn_actor(
-        capacity,
-        0_i64,
-        |state, msg| {
-            let mut delayed: Option<(Duration, ReplyTx<i64>, i64)> = None;
+pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<CounterHandle, ActorError> {
+    let factory = move || {
+        spawn_actor(
+            capacity,
+            0_i64,
+            |state, msg| {
+                let mut delayed: Option<(Duration, ReplyTx<i64>, i64)> = None;
 
-            let ctrl = match msg {
-                CounterMessage::Add { delta, reply } => {
-                    *state += delta;
-                    let _ = reply.send(*state);
-                    ActorCtrl::Continue
-                }
-                CounterMessage::Get { reply } => {
-                    let _ = reply.send(*state);
-                    ActorCtrl::Continue
-                }
-                CounterMessage::DelayGet { delay, reply } => {
-                    let value = *state;
-                    delayed = Some((delay, reply, value));
-                    ActorCtrl::Continue
-                }
-                CounterMessage::Stop { reply } => {
-                    let _ = reply.send(());
-                    ActorCtrl::Stop
-                }
-            };
+                let ctrl = match msg {
+                    CounterMessage::Add { delta, reply } => {
+                        *state += delta;
+                        let _ = reply.send(*state);
+                        ActorCtrl::Continue
+                    }
+                    CounterMessage::Get { reply } => {
+                        let _ = reply.send(*state);
+                        ActorCtrl::Continue
+                    }
+                    CounterMessage::DelayGet { delay, reply } => {
+                        let value = *state;
+                        delayed = Some((delay, reply, value));
+                        ActorCtrl::Continue
+                    }
+                    CounterMessage::Stop { reply } => {
+                        let _ = reply.send(());
+                        ActorCtrl::Stop
+                    }
+                    CounterMessage::CrashNow { reply } => {
+                        let _ = reply.send(());
+                        panic!("crash requested");
+                    }
+                };
 
-            async move {
-                if let Some((delay, reply, value)) = delayed {
-                    sleep(delay).await;
-                    let _ = reply.send(value);
+                async move {
+                    if let Some((delay, reply, value)) = delayed {
+                        sleep(delay).await;
+                        let _ = reply.send(value);
+                    }
+                    ctrl
                 }
-                ctrl
-            }
-        },
-    ).expect("capacity must be > 0");
-    (CounterHandle { tx, default_timeout: DEFAULT_TIMEOUT }, join)
+            },
+        )
+    };
+    let sup = Supervisor::start(factory, policy).await?;
+    Ok(CounterHandle { sup, default_timeout: DEFAULT_TIMEOUT })
 }
 
 #[cfg(test)]
@@ -223,7 +289,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_counter_add_get_happy_path() {
-        let (handle, _join) = spawn_counter(8);
+        let handle = match spawn_counter(8, RestartPolicy::MaxRetries(7)) {
+            Ok(res) => res,
+            Err(_) => return
+        };
 
         let v1 = handle.add(5).await.unwrap();
         assert_eq!(v1, 5);
