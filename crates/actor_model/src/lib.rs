@@ -405,5 +405,38 @@ mod tests {
         let mut v3 = handle.add(1).await;
         assert!(matches!(v3, Err(ActorError::SendFailed)));
     }
-}
 
+    #[tokio::test(start_paused = true)]
+    async fn test_stops_restarting_after_max_retries() {
+        let handle = spawn_counter(8, RestartPolicy::MaxRetries { n: 1 }).await.unwrap();
+        let _ = handle.crash_now().await;
+
+        let mut v3 = None;
+        for _ in 0..10 {
+            match handle.add(1).await {
+                Ok(v) => {
+                    v3 = Some(v);
+                    break;
+                }
+                Err(ActorError::SendFailed) => tokio::task::yield_now().await,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert_eq!(v3, Some(1));
+
+        let _ = handle.crash_now().await;
+
+        let mut ok = false;
+        for _ in 0..10 {
+            match handle.add(1).await {
+                Ok(_) => {
+                    ok = true;
+                    break;
+                }
+                Err(ActorError::SendFailed) => tokio::task::yield_now().await,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert!(!ok, "unexpected restart after retries exhausted");
+    }
+}
