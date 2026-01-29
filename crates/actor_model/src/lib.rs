@@ -289,10 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_counter_add_get_happy_path() {
-        let handle = match spawn_counter(8, RestartPolicy::MaxRetries(7)) {
-            Ok(res) => res,
-            Err(_) => return
-        };
+        let handle = spawn_counter(8, RestartPolicy::Never).await.unwrap();
 
         let v1 = handle.add(5).await.unwrap();
         assert_eq!(v1, 5);
@@ -308,18 +305,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_counter_stop_joins() {
-        let (handle, join) = spawn_counter(8);
-        
+        let handle = spawn_counter(8, RestartPolicy::Never).await.unwrap();
+
         let stop_res = handle.stop().await;
         assert!(stop_res.is_ok());
-
-        let join_res = join.await;
-        assert!(join_res.is_ok());
     }
 
     #[tokio::test]
     async fn test_counter_handle_clone_works() {
-        let (handle, _join) = spawn_counter(8);
+        let handle = spawn_counter(8, RestartPolicy::Never).await.unwrap();
         let handle2 = handle.clone();
 
         let v1 = handle.add(2).await.unwrap();
@@ -342,27 +336,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_exits_with_stop_by_message() {
-        let (handle, join) = spawn_counter(8);
-        let _ = handle.stop().await;
-        let exit = join.await.expect("Actor task panicked");
+        let (tx, join) = spawn_actor(8, 0_i64, |state, msg: i32| {
+            let _ = msg;
+            *state += 1;
+            std::future::ready(ActorCtrl::Stop)
+        }).unwrap();
+        tx.send(1).await.unwrap();
+        drop(tx);
+        let exit = join.await.unwrap();
         assert_eq!(exit, ExitReason::StoppedByMessage);
     }
 
     #[tokio::test]
-    async fn test_exits_with_all_senders_dropped() {
-        let (handle, join) = spawn_counter(8);
-        let handle2 = handle.clone();
-
-        drop(handle);
-        drop(handle2);
-
-        let exit = join.await.expect("actor task panicked");
-        assert_eq!(exit, ExitReason::AllSendersDropped); 
+    async fn test_actor_exit_reason_all_senders_dropped() {
+        let (tx, join) = spawn_actor(8, (), |_, _msg: ()| std::future::ready(ActorCtrl::Continue)).unwrap();
+        drop(tx);
+        let exit = join.await.unwrap();
+        assert_eq!(exit, ExitReason::AllSendersDropped);
     }
-
+    
     #[tokio::test]
     async fn test_override_path_works() {
-        let (handle, _join) = spawn_counter(8);
+        let handle = spawn_counter(8, RestartPolicy::Never).await.unwrap();
         let v1 = handle.get_with_timeout(Duration::from_millis(50)).await.unwrap();
         assert_eq!(v1, 0);
         let _ = handle.stop().await;
@@ -371,7 +366,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_timeout_triggered() {
-        let (handle, _join) = spawn_counter(8);
+        let handle = spawn_counter(8, RestartPolicy::Never).await.unwrap();
 
         let fut = handle.request_with_timeout(
             Some(Duration::from_millis(10)),
