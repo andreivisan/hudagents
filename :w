@@ -403,7 +403,7 @@ mod tests {
         let _v2 = handle.crash_now().await;
         
         let mut v3 = handle.add(1).await;
-        assert!(matches!(v3, Err(ActorError::SendFailed)));
+        assert!(matches!(res, Err(ActorError::SendFailed)))
     }
 }
 
