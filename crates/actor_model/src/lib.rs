@@ -7,7 +7,7 @@
 use std::{future::Future, sync::Arc};
 use tokio::{
     sync::{
-        mpsc::{channel, Sender},
+        mpsc::{error::TrySendError, channel, Sender},
         oneshot::{self, Sender as ReplyTx},
         RwLock,
     },
@@ -19,8 +19,9 @@ use tokio::{
 #[derive(Debug)]
 pub enum ActorError {
     InvalidCapacity,
-    SendFailed,
+    MailboxFull,
     ResponseDropped,
+    SendFailed,
     Timeout,
 }
 
@@ -47,6 +48,12 @@ pub enum RestartPolicy {
 pub enum Termination {
     Clean(ExitReason),
     Panic,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SendPolicy {
+    Backpressure,
+    FailFast,
 }
 
 // Helper function
@@ -183,15 +190,27 @@ enum CounterMessage {
     DelayGet { delay: Duration, reply: ReplyTx<i64> },
     Stop { reply: ReplyTx<()> },
     CrashNow { reply: ReplyTx<()> },
+    #[cfg(test)]
+    Hold { started: oneshot::Sender<()>, release: oneshot::Receiver<()> },
 }
 
 #[derive(Clone)]
 pub struct CounterHandle {
     sup: SupervisorHandle<CounterMessage>,
     default_timeout: Duration,
+    send_policy: SendPolicy,
 }
 
 impl CounterHandle {
+
+    pub fn with_policy(&self, policy: SendPolicy) -> Self {
+        Self {
+            sup: self.sup.clone(),
+            default_timeout: self.default_timeout.clone(),
+            send_policy: policy,
+        }
+    }
+
     async fn request<T>(
         &self, 
         make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage
@@ -200,7 +219,16 @@ impl CounterHandle {
         let msg = make_msg(reply_tx);
         let sender = self.sup.sender().await;
         println!("handle send");
-        sender.send(msg).await.map_err(|_| ActorError::SendFailed)?;
+        match self.send_policy {
+            SendPolicy::FailFast => {
+                match sender.try_send(msg) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
+                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
+                }
+            }
+            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
+        }
         println!("handle sent");
         reply_rx.await.map_err(|_| ActorError::ResponseDropped)
     } 
@@ -255,6 +283,7 @@ pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<Cou
             0_i64,
             |state, msg| {
                 let mut delayed: Option<(Duration, ReplyTx<i64>, i64)> = None;
+                let mut hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)> = None;
 
                 let ctrl = match msg {
                     CounterMessage::Add { delta, reply } => {
@@ -284,9 +313,18 @@ pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<Cou
                         println!("actor crash now");
                         panic!("crash requested");
                     }
+                    #[cfg(test)]
+                    CounterMessage::Hold { started, release } => {
+                        hold = Some((started, release));
+                        ActorCtrl::Continue
+                    }
                 };
 
                 async move {
+                    if let Some((started, release)) = hold {
+                        let _ = started.send(());
+                        let _ = release.await;
+                    }
                     if let Some((delay, reply, value)) = delayed {
                         sleep(delay).await;
                         let _ = reply.send(value);
@@ -297,7 +335,7 @@ pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<Cou
         )
     };
     let sup = Supervisor::start(factory, policy).await?;
-    Ok(CounterHandle { sup, default_timeout: DEFAULT_TIMEOUT })
+    Ok(CounterHandle { sup, default_timeout: DEFAULT_TIMEOUT, send_policy: SendPolicy::Backpressure })
 }
 
 #[cfg(test)]
@@ -473,5 +511,104 @@ mod tests {
             }
         }
         assert!(!ok, "unexpected restart after retries exhausted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ff_returns_mailboxfull_when_q_full() {
+        let counter = spawn_counter(1, RestartPolicy::Never).await.unwrap();
+        let handle = counter.with_policy(SendPolicy::FailFast);    
+        // send Hold
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+
+        let sender = counter.sup.sender().await; // tests can access private fields
+        sender.send(CounterMessage::Hold { started: started_tx, release: release_rx }).await.unwrap();
+
+        // wait until actor is blocked
+        let _ = started_rx.await;
+
+        // enqueue one request (fills queue)
+        let (dummy_tx, _dummy_rx) = oneshot::channel();
+        sender
+            .send(CounterMessage::Add { delta: 1, reply: dummy_tx })
+            .await
+            .unwrap();
+
+        // second request should fail fast
+        let res = handle.add(1).await;
+        assert!(matches!(res, Err(ActorError::MailboxFull)));
+
+        // release actor so the test doesn’t hang
+        let _ = release_tx.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_backpressure_does_not_return_mailboxfull() {
+        let counter = spawn_counter(1, RestartPolicy::Never).await.unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let sender = counter.sup.sender().await; // tests can access private fields
+        sender
+            .send(CounterMessage::Hold { started: started_tx, release: release_rx })
+            .await
+            .unwrap();
+
+        // Wait until actor is blocked
+        let _ = started_rx.await;
+
+        // Fill the queue deterministically (capacity = 1)
+        let (dummy_tx, _dummy_rx) = oneshot::channel();
+        sender
+            .send(CounterMessage::Add { delta: 1, reply: dummy_tx })
+            .await
+            .unwrap();
+        let h2 = counter.clone();
+        let pending = tokio::spawn(async move {
+            h2.add(1).await
+        });
+        let _ = release_tx.send(());
+        let res = pending.await.unwrap();
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cloned_handles_policy_independence() {
+        let counter = spawn_counter(1, RestartPolicy::Never).await.unwrap();
+
+        // default handle = Backpressure
+        let h2 = counter.with_policy(SendPolicy::FailFast);
+
+        // Hold actor
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+
+        let sender = counter.sup.sender().await;
+        sender
+            .send(CounterMessage::Hold { started: started_tx, release: release_rx })
+            .await
+            .unwrap();
+
+        let _ = started_rx.await;
+
+        // Fill queue deterministically
+        let (dummy_tx, _dummy_rx) = oneshot::channel();
+        sender
+            .send(CounterMessage::Add { delta: 1, reply: dummy_tx })
+            .await
+            .unwrap();
+
+        // Backpressure handle: will block
+        let pending = tokio::spawn(async move {
+            counter.add(1).await
+        });
+
+        // FailFast handle: should error immediately
+        let res = h2.add(1).await;
+        assert!(matches!(res, Err(ActorError::MailboxFull)));
+
+        // Release actor so backpressure can complete
+        let _ = release_tx.send(());
+        let res_bp = pending.await.unwrap();
+        assert!(res_bp.is_ok());
     }
 }
