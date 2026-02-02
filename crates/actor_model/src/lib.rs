@@ -1,3 +1,9 @@
+// ************************************************************************* //
+// ********************* Summary in one line ******************************* //
+// add → request_with_timeout → request → supervisor.sender() → mpsc send → 
+// actor recv → handler updates state → oneshot reply → back up stack.
+// ************************************************************************* //
+
 use std::{future::Future, sync::Arc};
 use tokio::{
     sync::{
@@ -74,14 +80,15 @@ where
         sender_slot: Arc<RwLock<Sender<Msg>>>,
         mut join: JoinHandle<ExitReason>
     ) {
-        let mut attemtps = 0;
+        let mut attempts = 0;
         loop {
             match join.await {
-                Ok(_exit) => { return; }
+                Ok(exit) => { println!("join ok: exit reason {:?}", exit); return; }
                 Err(err) => {
                     if !err.is_panic() { return; }
-                    if !allows_restart(policy, attemtps) { return; } 
-                    attemtps += 1;
+                    if !allows_restart(policy, attempts) { return; } 
+                    attempts += 1;
+                    println!("Restart attempt no. {}", attempts);
                     let (new_tx, new_join) = match factory() {
                         Ok(v) => v,
                         Err(_) => return,
@@ -91,6 +98,7 @@ where
                         let mut slot = sender_slot.write().await;
                         *slot = new_tx;
                     }
+                    println!("sender swapped");
                     join = new_join;
                 }
             }
@@ -151,7 +159,9 @@ where
     let join = tokio::spawn(async move {
         let mut state = initial_state;
         let mut handler = handler;
+        println!("Actor started");
         while let Some(msg) = rx.recv().await {
+            println!("Actor got message");
             match handler(&mut state, msg).await {
                 ActorCtrl::Continue => {}
                 ActorCtrl::Stop => return ExitReason::StoppedByMessage,
@@ -189,7 +199,9 @@ impl CounterHandle {
         let (reply_tx,  reply_rx) = oneshot::channel();
         let msg = make_msg(reply_tx);
         let sender = self.sup.sender().await;
+        println!("handle send");
         sender.send(msg).await.map_err(|_| ActorError::SendFailed)?;
+        println!("handle sent");
         reply_rx.await.map_err(|_| ActorError::ResponseDropped)
     } 
 
@@ -201,8 +213,8 @@ impl CounterHandle {
         let fut = self.request(make_msg);
         let effective_timeout = timeout_opt.unwrap_or(self.default_timeout);
         match timeout(effective_timeout, fut).await {
-            Ok(res) => res,
-            Err(_) => Err(ActorError::Timeout),
+            Ok(res) => { println!("reply ok"); res },
+            Err(_) => { println!("handle timeout"); Err(ActorError::Timeout) },
         }
     }
 
@@ -248,23 +260,28 @@ pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<Cou
                     CounterMessage::Add { delta, reply } => {
                         *state += delta;
                         let _ = reply.send(*state);
+                        println!("actor add + {} = {}", delta, *state);
                         ActorCtrl::Continue
                     }
                     CounterMessage::Get { reply } => {
                         let _ = reply.send(*state);
+                        println!("actor get = {}", *state);
                         ActorCtrl::Continue
                     }
                     CounterMessage::DelayGet { delay, reply } => {
                         let value = *state;
                         delayed = Some((delay, reply, value));
+                        println!("actor delay_get delay = {:?}", delay.as_nanos());
                         ActorCtrl::Continue
                     }
                     CounterMessage::Stop { reply } => {
                         let _ = reply.send(());
+                        println!("actor stop");
                         ActorCtrl::Stop
                     }
                     CounterMessage::CrashNow { reply } => {
                         let _ = reply.send(());
+                        println!("actor crash now");
                         panic!("crash requested");
                     }
                 };
@@ -286,6 +303,24 @@ pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<Cou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_parallel_actor_activity() {
+        let h1 = spawn_counter(8, RestartPolicy::Never).await.unwrap();
+        let h2 = spawn_counter(8, RestartPolicy::Never).await.unwrap();
+
+        let t1 = tokio::spawn(async move {
+            let _ = h1.add(1).await;
+            let _ = h1.add(2).await;
+        });
+
+        let t2 = tokio::spawn(async move {
+            let _ = h2.add(10).await;
+            let _ = h2.get().await;
+        });
+
+        let _ = tokio::join!(t1, t2);
+    }
 
     #[tokio::test]
     async fn test_counter_add_get_happy_path() {
