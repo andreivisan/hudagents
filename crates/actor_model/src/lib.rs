@@ -15,9 +15,13 @@ use tokio::{
     time::{sleep, timeout, Duration},
 };
 
-// === Generic actor runtime ===
+// ************************************************************************** //
+// ******************* ACTOR MODEL FRAMEWORK ******* ************************ //
+// ************************************************************************** //
+
 #[derive(Debug)]
 pub enum ActorError {
+    InitError,
     InvalidCapacity,
     MailboxFull,
     ResponseDropped,
@@ -179,7 +183,9 @@ where
     Ok((tx, join))
 }
 
-// === Counter example using the runtime ===
+// ************************************************************************** //
+// ******************* COUNTER ONE AGENT SIMMULATION ************************ //
+// ************************************************************************** //
 
 // Default timeout for actor requests (5s).
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -275,7 +281,6 @@ impl CounterHandle {
     }
 }
 
-
 pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<CounterHandle, ActorError> {
     let factory = move || {
         spawn_actor(
@@ -336,6 +341,231 @@ pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<Cou
     };
     let sup = Supervisor::start(factory, policy).await?;
     Ok(CounterHandle { sup, default_timeout: DEFAULT_TIMEOUT, send_policy: SendPolicy::Backpressure })
+}
+
+// ************************************************************************** //
+// ******************* ECHO MULTI AGENT SIMMULATION ************************* //
+// ************************************************************************** //
+
+pub struct EchoState { name: String, turns: u64 }
+
+enum EchoAgentMsg {
+    Respond { input: String, reply: oneshot::Sender<String> },
+    Stop { reply: oneshot::Sender<()> },
+}
+
+#[derive(Clone)]
+pub struct EchoAgentHandle {
+    sup: SupervisorHandle<EchoAgentMsg>,
+    default_timeout: Duration,
+    send_policy: SendPolicy,
+}
+
+impl EchoAgentHandle {
+
+    pub async fn respond(&self, input: impl Into<String>) -> Result<String, ActorError> {
+        let input = input.into();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let msg = EchoAgentMsg::Respond { input, reply: reply_tx };
+        let sender = self.sup.sender().await;
+        println!("Handle send");
+        match self.send_policy {
+            SendPolicy::FailFast => {
+                match sender.try_send(msg) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
+                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
+                }
+            }
+            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
+        }
+        println!("handle sent");
+        match timeout(self.default_timeout, reply_rx).await {
+            Ok(Ok(res)) => { println!("reply ok"); Ok(res) },
+            Ok(Err(_)) => Err(ActorError::ResponseDropped),
+            Err(_) => Err(ActorError::Timeout),
+        }
+    }
+
+    pub async fn stop(&self) -> Result<(), ActorError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let msg = EchoAgentMsg::Stop { reply: reply_tx };
+        let sender = self.sup.sender().await;
+        println!("Handle istop send");
+        match self.send_policy {
+            SendPolicy::FailFast => {
+                match sender.try_send(msg) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
+                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
+                }
+            }
+            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
+        }
+        println!("handle sent");
+        match timeout(self.default_timeout, reply_rx).await {
+            Ok(Ok(())) => { println!("reply ok"); Ok(()) },
+            Ok(Err(_)) => Err(ActorError::ResponseDropped),
+            Err(_) => Err(ActorError::Timeout),
+        }
+    }
+
+}
+
+#[derive(Clone)]
+pub struct GroupManagerState {
+    agents: Vec<EchoAgentHandle>,
+    next_idx: usize,
+}
+
+enum ManagerMsg {
+    Run { initial: String, max_turns: usize, reply: oneshot::Sender<Vec<String>> },
+    Stop { reply: oneshot::Sender<()> }
+}
+
+pub struct GroupManagerHandle {
+    sup: SupervisorHandle<ManagerMsg>,
+    default_timeout: Duration,
+    send_policy: SendPolicy,
+}
+
+impl GroupManagerHandle {
+    pub async fn run(&self, initial: impl Into<String>, max_turns: usize) -> Result<Vec<String>, ActorError> {
+        let initial = initial.into();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mngr_msg = ManagerMsg::Run { initial, max_turns, reply: reply_tx };
+        let sender = self.sup.sender().await;
+        println!("handle send");
+        match self.send_policy {
+            SendPolicy::FailFast => {
+                match sender.try_send(mngr_msg) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
+                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
+                }
+            }
+            SendPolicy::Backpressure => sender.send(mngr_msg).await.map_err(|_| ActorError::SendFailed)?,
+        }
+        println!("handle sent");
+        match timeout(self.default_timeout, reply_rx).await {
+            Ok(Ok(outputs)) => { println!("reply ok"); Ok(outputs) },
+            Ok(Err(_)) => Err(ActorError::ResponseDropped),
+            Err(_) => Err(ActorError::Timeout),
+        }
+    }
+
+    pub async fn stop(&self) -> Result<(), ActorError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let msg = ManagerMsg::Stop { reply: reply_tx };
+        let sender = self.sup.sender().await;
+        println!("Handle istop send");
+        match self.send_policy {
+            SendPolicy::FailFast => {
+                match sender.try_send(msg) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
+                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
+                }
+            }
+            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
+        }
+        println!("handle sent");
+        match timeout(self.default_timeout, reply_rx).await {
+            Ok(Ok(())) => { println!("reply ok"); Ok(()) },
+            Ok(Err(_)) => Err(ActorError::ResponseDropped),
+            Err(_) => Err(ActorError::Timeout),
+        }
+    }
+}
+
+pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, policy: RestartPolicy) -> Result<GroupManagerHandle, ActorError> {
+    if agents.len() == 0 { return Err(ActorError::InitError); }  
+    let factory = move || {
+        let initial_state = GroupManagerState { agents: agents.clone(), next_idx: 0 };
+        spawn_actor(capacity, initial_state, |state, msg| {
+            enum Action {
+                Run {
+                    picked: Vec<EchoAgentHandle>,
+                    initial: String,
+                    reply: oneshot::Sender<Vec<String>>
+                },
+                Stop {
+                    reply: oneshot::Sender<()> 
+                },
+            }
+
+            let action = match msg {
+                ManagerMsg::Run { initial, max_turns, reply } => {
+                    let len = state.agents.len();
+                    let mut picked = Vec::with_capacity(max_turns);
+                    for _ in 0..max_turns {
+                        let idx = state.next_idx;
+                        picked.push(state.agents[idx].clone());
+                        state.next_idx = (idx + 1) % len;
+                    }
+                    Action::Run { picked, initial, reply }
+                } 
+                ManagerMsg::Stop { reply } => Action::Stop { reply },
+            };
+
+            async move {
+                match action {
+                    Action::Run { picked, initial, reply } => {
+                        let mut outputs = Vec::new();
+                        let mut input = initial;
+                        for agent in picked {
+                            match agent.respond(input).await {
+                                Ok(out) => {
+                                    input = out.clone();
+                                    outputs.push(out);
+                                }
+                                Err(_e) => {
+                                    let _ = reply.send(outputs); 
+                                    return ActorCtrl::Continue;
+                                }
+                            }
+                        }
+                        let _ = reply.send(outputs);
+                        ActorCtrl::Continue
+                    }
+                    Action::Stop { reply } => {
+                        let _ = reply.send(());
+                        ActorCtrl::Continue
+                    }
+                }
+            }
+        })
+    };
+    let sup = Supervisor::start(factory, policy).await?;
+    Ok(GroupManagerHandle { sup, default_timeout: DEFAULT_TIMEOUT, send_policy: SendPolicy::Backpressure })
+} 
+
+pub async fn spawn_echo_agent(name: &str, capacity: usize, policy: RestartPolicy) -> Result<EchoAgentHandle, ActorError> {
+    let name = name.to_string();
+    let factory = move || {
+        let initial_echo_state = EchoState { name: name.clone(), turns: 0 };  
+        spawn_actor(
+            capacity,
+            initial_echo_state,
+            |state, msg| {
+                let ctrl = match msg {
+                    EchoAgentMsg::Respond { input, reply } => {
+                        state.turns += 1;
+                        let output = format!("{}[{}]: {}", state.name, state.turns, input);
+                        let _ = reply.send(output);
+                        ActorCtrl::Continue
+                    }
+                    EchoAgentMsg::Stop { reply } => {
+                        let _ = reply.send(());
+                        ActorCtrl::Stop
+                    }
+                };
+                async move { ctrl }
+            },
+        )   
+    };
+    let sup = Supervisor::start(factory, policy).await?;
+    Ok(EchoAgentHandle { sup, default_timeout: DEFAULT_TIMEOUT, send_policy: SendPolicy::Backpressure })
 }
 
 #[cfg(test)]
@@ -611,4 +841,23 @@ mod tests {
         let res_bp = pending.await.unwrap();
         assert!(res_bp.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_round_robin_order_is_correct() {
+        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never).await.unwrap();
+        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never).await.unwrap();
+        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never).await.unwrap();
+
+        let transcript = mgr.run("hello", 4).await.unwrap();
+
+        assert_eq!(transcript.len(), 4);
+        assert!(transcript[0].starts_with("alice[1]:"));
+        assert!(transcript[1].starts_with("bob[1]:"));
+        assert!(transcript[2].starts_with("alice[2]:"));
+        assert!(transcript[3].starts_with("bob[2]:"));
+    }
 }
+
+//Some notes about your code recommendation even though I implemented them as you recommended:
+// 1. A lot of code repetition in the respond and stop methods: One method with a parametrized response would suffice.
+// 2. A lot of repetition on declaring handlers: we can create a handle trait and everyone can implement that - it sounds like Java I know but we could really use it here as they all have supervisor, default_timeout and send_policy. 
