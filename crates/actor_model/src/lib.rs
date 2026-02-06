@@ -68,29 +68,19 @@ fn allows_restart(policy: RestartPolicy, attempts_so_far: usize) -> bool {
     }
 }
 
-struct Supervisor<Msg, F> 
-where
-    Msg: Send + 'static,
-    F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
-{
-    factory: F,
-    policy: RestartPolicy,
-    monitor_join: JoinHandle<()>,
-    restart_attempts: usize,
-    sender_slot: Arc<RwLock<Sender<Msg>>>,
-}
+struct Supervisor;
 
-impl<Msg, F> Supervisor<Msg, F>
-where
-    Msg: Send + 'static,
-    F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
-{
-    async fn monitor_loop(
-        factory: F, 
-        policy: RestartPolicy, 
+impl Supervisor {
+    async fn monitor_loop<Msg, F>(
+        factory: F,
+        policy: RestartPolicy,
         sender_slot: Arc<RwLock<Sender<Msg>>>,
-        mut join: JoinHandle<ExitReason>
-    ) {
+        mut join: JoinHandle<ExitReason>,
+    )
+    where
+        Msg: Send + 'static,
+        F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
+    {
         let mut attempts = 0;
         loop {
             match join.await {
@@ -111,12 +101,16 @@ where
                     }
                     println!("sender swapped");
                     join = new_join;
-                }
+               }
             }
        }
     }
 
-    async fn start(factory: F, policy: RestartPolicy) -> Result<SupervisorHandle<Msg>, ActorError> {
+    async fn start<Msg, F>(factory: F, policy: RestartPolicy) -> Result<SupervisorHandle<Msg>, ActorError>
+    where
+        Msg: Send + 'static,
+        F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
+    {
         let (tx, join) = (factory)()?;
         let sender_slot = Arc::new(RwLock::new(tx));
         tokio::spawn(Self::monitor_loop(factory, policy, sender_slot.clone(), join)); 
@@ -150,6 +144,87 @@ where
     fn clone(&self) -> Self {
         Self {
             sender_slot: self.sender_slot.clone(),           
+        }
+    }
+}
+
+struct HandleCore<Msg>
+where
+    Msg: Send + 'static,
+{
+    sup: SupervisorHandle<Msg>,
+    default_timeout: Duration,
+    send_policy: SendPolicy,
+}
+
+impl<Msg> HandleCore<Msg>
+where
+    Msg: Send + 'static,
+{
+    fn new(sup: SupervisorHandle<Msg>, default_timeout: Duration, send_policy: SendPolicy) -> Self {
+        Self {
+            sup,
+            default_timeout,
+            send_policy,
+        }
+    }
+
+    fn with_policy(&self, send_policy: SendPolicy) -> Self {
+        Self {
+            sup: self.sup.clone(),
+            default_timeout: self.default_timeout,
+            send_policy,
+        }
+    }
+
+    async fn send(&self, msg: Msg) -> Result<(), ActorError> {
+        let sender = self.sup.sender().await;
+        println!("handle send");
+        match self.send_policy {
+            SendPolicy::FailFast => match sender.try_send(msg) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
+                Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
+            },
+            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
+        }
+        println!("handle sent");
+        Ok(())
+    }
+
+    async fn request<T>(
+        &self,
+        timeout_opt: Option<Duration>,
+        make_msg: impl FnOnce(ReplyTx<T>) -> Msg,
+    ) -> Result<T, ActorError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let msg = make_msg(reply_tx);
+        self.send(msg).await?;
+
+        let effective_timeout = timeout_opt.unwrap_or(self.default_timeout);
+        match timeout(effective_timeout, reply_rx).await {
+            Ok(Ok(res)) => {
+                println!("reply ok");
+                Ok(res)
+            }
+            Ok(Err(_)) => Err(ActorError::ResponseDropped),
+            Err(_) => {
+                println!("handle timeout");
+                Err(ActorError::Timeout)
+            }
+        }
+    }
+}
+
+impl<Msg> Clone for HandleCore<Msg>
+where
+    Msg: Send + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            sup: self.sup.clone(),
+            default_timeout: self.default_timeout,
+            send_policy: self.send_policy,
         }
     }
 }
@@ -202,18 +277,14 @@ enum CounterMessage {
 
 #[derive(Clone)]
 pub struct CounterHandle {
-    sup: SupervisorHandle<CounterMessage>,
-    default_timeout: Duration,
-    send_policy: SendPolicy,
+    core: HandleCore<CounterMessage>,
 }
 
 impl CounterHandle {
 
     pub fn with_policy(&self, policy: SendPolicy) -> Self {
         Self {
-            sup: self.sup.clone(),
-            default_timeout: self.default_timeout.clone(),
-            send_policy: policy,
+            core: self.core.with_policy(policy),
         }
     }
 
@@ -221,22 +292,7 @@ impl CounterHandle {
         &self, 
         make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage
     ) -> Result<T, ActorError> {
-        let (reply_tx,  reply_rx) = oneshot::channel();
-        let msg = make_msg(reply_tx);
-        let sender = self.sup.sender().await;
-        println!("handle send");
-        match self.send_policy {
-            SendPolicy::FailFast => {
-                match sender.try_send(msg) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
-                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
-                }
-            }
-            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
-        }
-        println!("handle sent");
-        reply_rx.await.map_err(|_| ActorError::ResponseDropped)
+        self.request_with_timeout(None, make_msg).await
     } 
 
     async fn request_with_timeout<T>(
@@ -244,16 +300,11 @@ impl CounterHandle {
         timeout_opt: Option<Duration>,
         make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage
     ) -> Result<T, ActorError> {
-        let fut = self.request(make_msg);
-        let effective_timeout = timeout_opt.unwrap_or(self.default_timeout);
-        match timeout(effective_timeout, fut).await {
-            Ok(res) => { println!("reply ok"); res },
-            Err(_) => { println!("handle timeout"); Err(ActorError::Timeout) },
-        }
+        self.core.request(timeout_opt, make_msg).await
     }
 
     pub async fn add(&self, delta: i64) -> Result<i64, ActorError> {
-        self.request_with_timeout(None, |reply| CounterMessage::Add { delta, reply }).await
+        self.request(|reply| CounterMessage::Add { delta, reply }).await
     }
 
     pub async fn add_with_timeout(&self, delta: i64, duration: Duration) -> Result<i64, ActorError> {
@@ -261,7 +312,7 @@ impl CounterHandle {
     }
 
     pub async fn get(&self) -> Result<i64, ActorError> {
-        self.request_with_timeout(None, |reply| CounterMessage::Get { reply }).await
+        self.request(|reply| CounterMessage::Get { reply }).await
     }
 
     pub async fn get_with_timeout(&self, duration: Duration) -> Result<i64, ActorError> {
@@ -269,7 +320,7 @@ impl CounterHandle {
     }
 
     pub async fn stop(&self) -> Result<(), ActorError> {
-        self.request_with_timeout(None, |reply| CounterMessage::Stop { reply }).await
+        self.request(|reply| CounterMessage::Stop { reply }).await
     }
 
     pub async fn stop_with_timeout(&self, duration: Duration) -> Result<(), ActorError> {
@@ -277,7 +328,7 @@ impl CounterHandle {
     }
 
     pub async fn crash_now(&self) -> Result<(), ActorError> {
-        self.request_with_timeout(None, |reply| CounterMessage::CrashNow { reply }).await
+        self.request(|reply| CounterMessage::CrashNow { reply }).await
     }
 }
 
@@ -340,7 +391,9 @@ pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<Cou
         )
     };
     let sup = Supervisor::start(factory, policy).await?;
-    Ok(CounterHandle { sup, default_timeout: DEFAULT_TIMEOUT, send_policy: SendPolicy::Backpressure })
+    Ok(CounterHandle {
+        core: HandleCore::new(sup, DEFAULT_TIMEOUT, SendPolicy::Backpressure),
+    })
 }
 
 // ************************************************************************** //
@@ -356,65 +409,29 @@ enum EchoAgentMsg {
 
 #[derive(Clone)]
 pub struct EchoAgentHandle {
-    sup: SupervisorHandle<EchoAgentMsg>,
-    default_timeout: Duration,
-    send_policy: SendPolicy,
+    core: HandleCore<EchoAgentMsg>,
 }
 
 impl EchoAgentHandle {
 
     pub async fn respond(&self, input: impl Into<String>) -> Result<String, ActorError> {
         let input = input.into();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let msg = EchoAgentMsg::Respond { input, reply: reply_tx };
-        let sender = self.sup.sender().await;
-        println!("Handle send");
-        match self.send_policy {
-            SendPolicy::FailFast => {
-                match sender.try_send(msg) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
-                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
-                }
-            }
-            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
-        }
-        println!("handle sent");
-        match timeout(self.default_timeout, reply_rx).await {
-            Ok(Ok(res)) => { println!("reply ok"); Ok(res) },
-            Ok(Err(_)) => Err(ActorError::ResponseDropped),
-            Err(_) => Err(ActorError::Timeout),
-        }
+        self.core
+            .request(None, |reply| EchoAgentMsg::Respond { input, reply })
+            .await
     }
 
     pub async fn stop(&self) -> Result<(), ActorError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let msg = EchoAgentMsg::Stop { reply: reply_tx };
-        let sender = self.sup.sender().await;
-        println!("Handle istop send");
-        match self.send_policy {
-            SendPolicy::FailFast => {
-                match sender.try_send(msg) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
-                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
-                }
-            }
-            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
-        }
-        println!("handle sent");
-        match timeout(self.default_timeout, reply_rx).await {
-            Ok(Ok(())) => { println!("reply ok"); Ok(()) },
-            Ok(Err(_)) => Err(ActorError::ResponseDropped),
-            Err(_) => Err(ActorError::Timeout),
-        }
+        self.core
+            .request(None, |reply| EchoAgentMsg::Stop { reply })
+            .await
     }
 
 }
 
 #[derive(Clone)]
 pub struct GroupManagerState {
-    agents: Vec<EchoAgentHandle>,
+    agents: Arc<[EchoAgentHandle]>,
     next_idx: usize,
 }
 
@@ -424,64 +441,32 @@ enum ManagerMsg {
 }
 
 pub struct GroupManagerHandle {
-    sup: SupervisorHandle<ManagerMsg>,
-    default_timeout: Duration,
-    send_policy: SendPolicy,
+    core: HandleCore<ManagerMsg>,
 }
 
 impl GroupManagerHandle {
     pub async fn run(&self, initial: impl Into<String>, max_turns: usize) -> Result<Vec<String>, ActorError> {
         let initial = initial.into();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let mngr_msg = ManagerMsg::Run { initial, max_turns, reply: reply_tx };
-        let sender = self.sup.sender().await;
-        println!("handle send");
-        match self.send_policy {
-            SendPolicy::FailFast => {
-                match sender.try_send(mngr_msg) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
-                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
-                }
-            }
-            SendPolicy::Backpressure => sender.send(mngr_msg).await.map_err(|_| ActorError::SendFailed)?,
-        }
-        println!("handle sent");
-        match timeout(self.default_timeout, reply_rx).await {
-            Ok(Ok(outputs)) => { println!("reply ok"); Ok(outputs) },
-            Ok(Err(_)) => Err(ActorError::ResponseDropped),
-            Err(_) => Err(ActorError::Timeout),
-        }
+        self.core
+            .request(None, |reply| ManagerMsg::Run {
+                initial,
+                max_turns,
+                reply,
+            })
+            .await
     }
 
     pub async fn stop(&self) -> Result<(), ActorError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let msg = ManagerMsg::Stop { reply: reply_tx };
-        let sender = self.sup.sender().await;
-        println!("Handle istop send");
-        match self.send_policy {
-            SendPolicy::FailFast => {
-                match sender.try_send(msg) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
-                    Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
-                }
-            }
-            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
-        }
-        println!("handle sent");
-        match timeout(self.default_timeout, reply_rx).await {
-            Ok(Ok(())) => { println!("reply ok"); Ok(()) },
-            Ok(Err(_)) => Err(ActorError::ResponseDropped),
-            Err(_) => Err(ActorError::Timeout),
-        }
+        self.core.request(None, |reply| ManagerMsg::Stop { reply }).await
     }
 }
 
 pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, policy: RestartPolicy) -> Result<GroupManagerHandle, ActorError> {
-    if agents.len() == 0 { return Err(ActorError::InitError); }  
+    if agents.is_empty() { return Err(ActorError::InitError); }
+    let agents = Arc::<[EchoAgentHandle]>::from(agents);
+    let factory_agents = agents.clone();
     let factory = move || {
-        let initial_state = GroupManagerState { agents: agents.clone(), next_idx: 0 };
+        let initial_state = GroupManagerState { agents: factory_agents.clone(), next_idx: 0 };
         spawn_actor(capacity, initial_state, |state, msg| {
             enum Action {
                 Run {
@@ -512,11 +497,11 @@ pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, 
                 match action {
                     Action::Run { picked, initial, reply } => {
                         let mut outputs = Vec::new();
-                        let mut input = initial;
+                        let mut current = initial;
                         for agent in picked {
-                            match agent.respond(input).await {
+                            match agent.respond(current.clone()).await {
                                 Ok(out) => {
-                                    input = out.clone();
+                                    current = out.clone();
                                     outputs.push(out);
                                 }
                                 Err(_e) => {
@@ -537,7 +522,9 @@ pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, 
         })
     };
     let sup = Supervisor::start(factory, policy).await?;
-    Ok(GroupManagerHandle { sup, default_timeout: DEFAULT_TIMEOUT, send_policy: SendPolicy::Backpressure })
+    Ok(GroupManagerHandle {
+        core: HandleCore::new(sup, DEFAULT_TIMEOUT, SendPolicy::Backpressure),
+    })
 } 
 
 pub async fn spawn_echo_agent(name: &str, capacity: usize, policy: RestartPolicy) -> Result<EchoAgentHandle, ActorError> {
@@ -565,7 +552,9 @@ pub async fn spawn_echo_agent(name: &str, capacity: usize, policy: RestartPolicy
         )   
     };
     let sup = Supervisor::start(factory, policy).await?;
-    Ok(EchoAgentHandle { sup, default_timeout: DEFAULT_TIMEOUT, send_policy: SendPolicy::Backpressure })
+    Ok(EchoAgentHandle {
+        core: HandleCore::new(sup, DEFAULT_TIMEOUT, SendPolicy::Backpressure),
+    })
 }
 
 #[cfg(test)]
@@ -705,7 +694,7 @@ mod tests {
         let _v1 = handle.add(10).await;
         let _v2 = handle.crash_now().await;
         
-        let mut v3 = handle.add(1).await;
+        let v3 = handle.add(1).await;
         assert!(matches!(v3, Err(ActorError::SendFailed)));
     }
 
@@ -751,7 +740,7 @@ mod tests {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
 
-        let sender = counter.sup.sender().await; // tests can access private fields
+        let sender = counter.core.sup.sender().await; // tests can access private fields
         sender.send(CounterMessage::Hold { started: started_tx, release: release_rx }).await.unwrap();
 
         // wait until actor is blocked
@@ -777,7 +766,7 @@ mod tests {
         let counter = spawn_counter(1, RestartPolicy::Never).await.unwrap();
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
-        let sender = counter.sup.sender().await; // tests can access private fields
+        let sender = counter.core.sup.sender().await; // tests can access private fields
         sender
             .send(CounterMessage::Hold { started: started_tx, release: release_rx })
             .await
@@ -812,7 +801,7 @@ mod tests {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
 
-        let sender = counter.sup.sender().await;
+        let sender = counter.core.sup.sender().await;
         sender
             .send(CounterMessage::Hold { started: started_tx, release: release_rx })
             .await
