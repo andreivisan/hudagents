@@ -530,7 +530,7 @@ pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, 
                     }
                     Action::Stop { reply } => {
                         let _ = reply.send(());
-                        ActorCtrl::Continue
+                        ActorCtrl::Stop
                     }
                 }
             }
@@ -855,6 +855,36 @@ mod tests {
         assert!(transcript[1].starts_with("bob[1]:"));
         assert!(transcript[2].starts_with("alice[2]:"));
         assert!(transcript[3].starts_with("bob[2]:"));
+    }
+
+    #[tokio::test]
+    async fn test_chaining_correctness() {
+        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never).await.unwrap();
+        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never).await.unwrap();
+        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never).await.unwrap();
+
+        let transcript = mgr.run("hello", 4).await.unwrap();
+
+        assert_eq!(transcript.len(), 4);
+        assert!(transcript[1].ends_with(&transcript[0]));
+        assert!(transcript[2].ends_with(&transcript[1]));
+        assert!(transcript[3].ends_with(&transcript[2]));
+    }
+
+    #[tokio::test]
+    async fn test_manager_stop_ends_manager() {
+        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never).await.unwrap();
+        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never).await.unwrap();
+        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never).await.unwrap();
+
+        let stop_res = mgr.stop().await;
+        assert!(stop_res.is_ok());
+
+        let run_res = mgr.run("hello", 2).await;
+        assert!(matches!(
+            run_res,
+            Err(ActorError::SendFailed) | Err(ActorError::Timeout)
+        ));
     }
 }
 
