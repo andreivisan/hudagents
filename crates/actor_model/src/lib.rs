@@ -887,7 +887,3 @@ mod tests {
         ));
     }
 }
-
-//Some notes about your code recommendation even though I implemented them as you recommended:
-// 1. A lot of code repetition in the respond and stop methods: One method with a parametrized response would suffice.
-// 2. A lot of repetition on declaring handlers: we can create a handle trait and everyone can implement that - it sounds like Java I know but we could really use it here as they all have supervisor, default_timeout and send_policy. 
