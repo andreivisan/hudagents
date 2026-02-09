@@ -1,18 +1,18 @@
 // ************************************************************************* //
 // ********************* Summary in one line ******************************* //
-// add → request_with_timeout → request → supervisor.sender() → mpsc send → 
+// add → request_with_timeout → request → supervisor.sender() → mpsc send →
 // actor recv → handler updates state → oneshot reply → back up stack.
 // ************************************************************************* //
 
 use std::{future::Future, sync::Arc};
 use tokio::{
     sync::{
-        mpsc::{error::TrySendError, channel, Sender},
-        oneshot::{self, Sender as ReplyTx},
         RwLock,
+        mpsc::{Sender, channel, error::TrySendError},
+        oneshot::{self, Sender as ReplyTx},
     },
     task::JoinHandle,
-    time::{sleep, timeout, Duration},
+    time::{Duration, sleep, timeout},
 };
 
 // ************************************************************************** //
@@ -47,7 +47,6 @@ pub enum RestartPolicy {
     Never,
 }
 
-
 #[derive(Debug)]
 pub enum Termination {
     Clean(ExitReason),
@@ -63,8 +62,8 @@ pub enum SendPolicy {
 // Helper function
 fn allows_restart(policy: RestartPolicy, attempts_so_far: usize) -> bool {
     match policy {
-        RestartPolicy::MaxRetries{ n } => attempts_so_far < n,
-        RestartPolicy::Never => { false }
+        RestartPolicy::MaxRetries { n } => attempts_so_far < n,
+        RestartPolicy::Never => false,
     }
 }
 
@@ -76,18 +75,27 @@ impl Supervisor {
         policy: RestartPolicy,
         sender_slot: Arc<RwLock<Sender<Msg>>>,
         mut join: JoinHandle<ExitReason>,
-    )
-    where
+    ) where
         Msg: Send + 'static,
-        F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
+        F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError>
+            + Send
+            + Sync
+            + 'static,
     {
         let mut attempts = 0;
         loop {
             match join.await {
-                Ok(exit) => { println!("join ok: exit reason {:?}", exit); return; }
+                Ok(exit) => {
+                    println!("join ok: exit reason {:?}", exit);
+                    return;
+                }
                 Err(err) => {
-                    if !err.is_panic() { return; }
-                    if !allows_restart(policy, attempts) { return; } 
+                    if !err.is_panic() {
+                        return;
+                    }
+                    if !allows_restart(policy, attempts) {
+                        return;
+                    }
                     attempts += 1;
                     println!("Restart attempt no. {}", attempts);
                     let (new_tx, new_join) = match factory() {
@@ -101,20 +109,31 @@ impl Supervisor {
                     }
                     println!("sender swapped");
                     join = new_join;
-               }
+                }
             }
-       }
+        }
     }
 
-    async fn start<Msg, F>(factory: F, policy: RestartPolicy) -> Result<SupervisorHandle<Msg>, ActorError>
+    async fn start<Msg, F>(
+        factory: F,
+        policy: RestartPolicy,
+    ) -> Result<SupervisorHandle<Msg>, ActorError>
     where
         Msg: Send + 'static,
-        F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError> + Send + Sync + 'static,
+        F: Fn() -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError>
+            + Send
+            + Sync
+            + 'static,
     {
         let (tx, join) = (factory)()?;
         let sender_slot = Arc::new(RwLock::new(tx));
-        tokio::spawn(Self::monitor_loop(factory, policy, sender_slot.clone(), join)); 
-        Ok(SupervisorHandle { sender_slot })    
+        tokio::spawn(Self::monitor_loop(
+            factory,
+            policy,
+            sender_slot.clone(),
+            join,
+        ));
+        Ok(SupervisorHandle { sender_slot })
     }
 }
 
@@ -125,9 +144,9 @@ where
     sender_slot: Arc<RwLock<Sender<Msg>>>,
 }
 
-impl<Msg> SupervisorHandle<Msg> 
+impl<Msg> SupervisorHandle<Msg>
 where
-    Msg: Send + 'static
+    Msg: Send + 'static,
 {
     async fn sender(&self) -> Sender<Msg> {
         let guard = self.sender_slot.read().await;
@@ -139,11 +158,11 @@ where
 
 impl<Msg> Clone for SupervisorHandle<Msg>
 where
-    Msg: Send + 'static
+    Msg: Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
-            sender_slot: self.sender_slot.clone(),           
+            sender_slot: self.sender_slot.clone(),
         }
     }
 }
@@ -186,7 +205,9 @@ where
                 Err(TrySendError::Full(_)) => return Err(ActorError::MailboxFull),
                 Err(TrySendError::Closed(_)) => return Err(ActorError::SendFailed),
             },
-            SendPolicy::Backpressure => sender.send(msg).await.map_err(|_| ActorError::SendFailed)?,
+            SendPolicy::Backpressure => {
+                sender.send(msg).await.map_err(|_| ActorError::SendFailed)?
+            }
         }
         println!("handle sent");
         Ok(())
@@ -232,15 +253,17 @@ where
 pub fn spawn_actor<State, Msg, Handler, Fut>(
     capacity: usize,
     initial_state: State,
-    handler: Handler
+    handler: Handler,
 ) -> Result<(Sender<Msg>, JoinHandle<ExitReason>), ActorError>
 where
     State: Send + 'static,
     Msg: Send + 'static,
     Handler: FnMut(&mut State, Msg) -> Fut + Send + 'static,
-    Fut: Future<Output = ActorCtrl> + Send + 'static
+    Fut: Future<Output = ActorCtrl> + Send + 'static,
 {
-    if capacity == 0 { return Err(ActorError::InvalidCapacity) }
+    if capacity == 0 {
+        return Err(ActorError::InvalidCapacity);
+    }
     let (tx, mut rx) = channel::<Msg>(capacity);
     let join = tokio::spawn(async move {
         let mut state = initial_state;
@@ -266,13 +289,28 @@ where
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
 
 enum CounterMessage {
-    Add { delta: i64, reply: ReplyTx<i64> },
-    Get { reply: ReplyTx<i64> },
-    DelayGet { delay: Duration, reply: ReplyTx<i64> },
-    Stop { reply: ReplyTx<()> },
-    CrashNow { reply: ReplyTx<()> },
+    Add {
+        delta: i64,
+        reply: ReplyTx<i64>,
+    },
+    Get {
+        reply: ReplyTx<i64>,
+    },
+    DelayGet {
+        delay: Duration,
+        reply: ReplyTx<i64>,
+    },
+    Stop {
+        reply: ReplyTx<()>,
+    },
+    CrashNow {
+        reply: ReplyTx<()>,
+    },
     #[cfg(test)]
-    Hold { started: oneshot::Sender<()>, release: oneshot::Receiver<()> },
+    Hold {
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -281,7 +319,6 @@ pub struct CounterHandle {
 }
 
 impl CounterHandle {
-
     pub fn with_policy(&self, policy: SendPolicy) -> Self {
         Self {
             core: self.core.with_policy(policy),
@@ -289,26 +326,32 @@ impl CounterHandle {
     }
 
     async fn request<T>(
-        &self, 
-        make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage
+        &self,
+        make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage,
     ) -> Result<T, ActorError> {
         self.request_with_timeout(None, make_msg).await
-    } 
+    }
 
     async fn request_with_timeout<T>(
-        &self, 
+        &self,
         timeout_opt: Option<Duration>,
-        make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage
+        make_msg: impl FnOnce(ReplyTx<T>) -> CounterMessage,
     ) -> Result<T, ActorError> {
         self.core.request(timeout_opt, make_msg).await
     }
 
     pub async fn add(&self, delta: i64) -> Result<i64, ActorError> {
-        self.request(|reply| CounterMessage::Add { delta, reply }).await
+        self.request(|reply| CounterMessage::Add { delta, reply })
+            .await
     }
 
-    pub async fn add_with_timeout(&self, delta: i64, duration: Duration) -> Result<i64, ActorError> {
-        self.request_with_timeout(Some(duration), |reply| CounterMessage::Add { delta, reply }).await
+    pub async fn add_with_timeout(
+        &self,
+        delta: i64,
+        duration: Duration,
+    ) -> Result<i64, ActorError> {
+        self.request_with_timeout(Some(duration), |reply| CounterMessage::Add { delta, reply })
+            .await
     }
 
     pub async fn get(&self) -> Result<i64, ActorError> {
@@ -316,7 +359,8 @@ impl CounterHandle {
     }
 
     pub async fn get_with_timeout(&self, duration: Duration) -> Result<i64, ActorError> {
-        self.request_with_timeout(Some(duration), |reply| CounterMessage::Get { reply }).await
+        self.request_with_timeout(Some(duration), |reply| CounterMessage::Get { reply })
+            .await
     }
 
     pub async fn stop(&self) -> Result<(), ActorError> {
@@ -324,71 +368,72 @@ impl CounterHandle {
     }
 
     pub async fn stop_with_timeout(&self, duration: Duration) -> Result<(), ActorError> {
-        self.request_with_timeout(Some(duration), |reply| CounterMessage::Stop { reply }).await
+        self.request_with_timeout(Some(duration), |reply| CounterMessage::Stop { reply })
+            .await
     }
 
     pub async fn crash_now(&self) -> Result<(), ActorError> {
-        self.request(|reply| CounterMessage::CrashNow { reply }).await
+        self.request(|reply| CounterMessage::CrashNow { reply })
+            .await
     }
 }
 
-pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<CounterHandle, ActorError> {
+pub async fn spawn_counter(
+    capacity: usize,
+    policy: RestartPolicy,
+) -> Result<CounterHandle, ActorError> {
     let factory = move || {
-        spawn_actor(
-            capacity,
-            0_i64,
-            |state, msg| {
-                let mut delayed: Option<(Duration, ReplyTx<i64>, i64)> = None;
-                let mut hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)> = None;
+        spawn_actor(capacity, 0_i64, |state, msg| {
+            let mut delayed: Option<(Duration, ReplyTx<i64>, i64)> = None;
+            let mut hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)> = None;
 
-                let ctrl = match msg {
-                    CounterMessage::Add { delta, reply } => {
-                        *state += delta;
-                        let _ = reply.send(*state);
-                        println!("actor add + {} = {}", delta, *state);
-                        ActorCtrl::Continue
-                    }
-                    CounterMessage::Get { reply } => {
-                        let _ = reply.send(*state);
-                        println!("actor get = {}", *state);
-                        ActorCtrl::Continue
-                    }
-                    CounterMessage::DelayGet { delay, reply } => {
-                        let value = *state;
-                        delayed = Some((delay, reply, value));
-                        println!("actor delay_get delay = {:?}", delay.as_nanos());
-                        ActorCtrl::Continue
-                    }
-                    CounterMessage::Stop { reply } => {
-                        let _ = reply.send(());
-                        println!("actor stop");
-                        ActorCtrl::Stop
-                    }
-                    CounterMessage::CrashNow { reply } => {
-                        let _ = reply.send(());
-                        println!("actor crash now");
-                        panic!("crash requested");
-                    }
-                    #[cfg(test)]
-                    CounterMessage::Hold { started, release } => {
-                        hold = Some((started, release));
-                        ActorCtrl::Continue
-                    }
-                };
-
-                async move {
-                    if let Some((started, release)) = hold {
-                        let _ = started.send(());
-                        let _ = release.await;
-                    }
-                    if let Some((delay, reply, value)) = delayed {
-                        sleep(delay).await;
-                        let _ = reply.send(value);
-                    }
-                    ctrl
+            let ctrl = match msg {
+                CounterMessage::Add { delta, reply } => {
+                    *state += delta;
+                    let _ = reply.send(*state);
+                    println!("actor add + {} = {}", delta, *state);
+                    ActorCtrl::Continue
                 }
-            },
-        )
+                CounterMessage::Get { reply } => {
+                    let _ = reply.send(*state);
+                    println!("actor get = {}", *state);
+                    ActorCtrl::Continue
+                }
+                CounterMessage::DelayGet { delay, reply } => {
+                    let value = *state;
+                    delayed = Some((delay, reply, value));
+                    println!("actor delay_get delay = {:?}", delay.as_nanos());
+                    ActorCtrl::Continue
+                }
+                CounterMessage::Stop { reply } => {
+                    let _ = reply.send(());
+                    println!("actor stop");
+                    ActorCtrl::Stop
+                }
+                CounterMessage::CrashNow { reply } => {
+                    let _ = reply.send(());
+                    println!("actor crash now");
+                    panic!("crash requested");
+                }
+                #[cfg(test)]
+                CounterMessage::Hold { started, release } => {
+                    hold = Some((started, release));
+                    ActorCtrl::Continue
+                }
+            };
+
+            async move {
+                if let Some((started, release)) = hold {
+                    let _ = started.send(());
+                    let _ = release.await;
+                }
+                if let Some((delay, reply, value)) = delayed {
+                    sleep(delay).await;
+                    let _ = reply.send(value);
+                }
+                ctrl
+            }
+        })
     };
     let sup = Supervisor::start(factory, policy).await?;
     Ok(CounterHandle {
@@ -400,11 +445,19 @@ pub async fn spawn_counter(capacity: usize, policy: RestartPolicy) -> Result<Cou
 // ******************* ECHO MULTI AGENT SIMMULATION ************************* //
 // ************************************************************************** //
 
-pub struct EchoState { name: String, turns: u64 }
+pub struct EchoState {
+    name: String,
+    turns: u64,
+}
 
 enum EchoAgentMsg {
-    Respond { input: String, reply: oneshot::Sender<String> },
-    Stop { reply: oneshot::Sender<()> },
+    Respond {
+        input: String,
+        reply: oneshot::Sender<String>,
+    },
+    Stop {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -413,7 +466,6 @@ pub struct EchoAgentHandle {
 }
 
 impl EchoAgentHandle {
-
     pub async fn respond(&self, input: impl Into<String>) -> Result<String, ActorError> {
         let input = input.into();
         self.core
@@ -426,7 +478,6 @@ impl EchoAgentHandle {
             .request(None, |reply| EchoAgentMsg::Stop { reply })
             .await
     }
-
 }
 
 #[derive(Clone)]
@@ -436,8 +487,14 @@ pub struct GroupManagerState {
 }
 
 enum ManagerMsg {
-    Run { initial: String, max_turns: usize, reply: oneshot::Sender<Vec<String>> },
-    Stop { reply: oneshot::Sender<()> }
+    Run {
+        initial: String,
+        max_turns: usize,
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    Stop {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 pub struct GroupManagerHandle {
@@ -445,7 +502,11 @@ pub struct GroupManagerHandle {
 }
 
 impl GroupManagerHandle {
-    pub async fn run(&self, initial: impl Into<String>, max_turns: usize) -> Result<Vec<String>, ActorError> {
+    pub async fn run(
+        &self,
+        initial: impl Into<String>,
+        max_turns: usize,
+    ) -> Result<Vec<String>, ActorError> {
         let initial = initial.into();
         self.core
             .request(None, |reply| ManagerMsg::Run {
@@ -457,30 +518,45 @@ impl GroupManagerHandle {
     }
 
     pub async fn stop(&self) -> Result<(), ActorError> {
-        self.core.request(None, |reply| ManagerMsg::Stop { reply }).await
+        self.core
+            .request(None, |reply| ManagerMsg::Stop { reply })
+            .await
     }
 }
 
-pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, policy: RestartPolicy) -> Result<GroupManagerHandle, ActorError> {
-    if agents.is_empty() { return Err(ActorError::InitError); }
+pub async fn spawn_group_manager(
+    agents: Vec<EchoAgentHandle>,
+    capacity: usize,
+    policy: RestartPolicy,
+) -> Result<GroupManagerHandle, ActorError> {
+    if agents.is_empty() {
+        return Err(ActorError::InitError);
+    }
     let agents = Arc::<[EchoAgentHandle]>::from(agents);
     let factory_agents = agents.clone();
     let factory = move || {
-        let initial_state = GroupManagerState { agents: factory_agents.clone(), next_idx: 0 };
+        let initial_state = GroupManagerState {
+            agents: factory_agents.clone(),
+            next_idx: 0,
+        };
         spawn_actor(capacity, initial_state, |state, msg| {
             enum Action {
                 Run {
                     picked: Vec<EchoAgentHandle>,
                     initial: String,
-                    reply: oneshot::Sender<Vec<String>>
+                    reply: oneshot::Sender<Vec<String>>,
                 },
                 Stop {
-                    reply: oneshot::Sender<()> 
+                    reply: oneshot::Sender<()>,
                 },
             }
 
             let action = match msg {
-                ManagerMsg::Run { initial, max_turns, reply } => {
+                ManagerMsg::Run {
+                    initial,
+                    max_turns,
+                    reply,
+                } => {
                     let len = state.agents.len();
                     let mut picked = Vec::with_capacity(max_turns);
                     for _ in 0..max_turns {
@@ -488,14 +564,22 @@ pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, 
                         picked.push(state.agents[idx].clone());
                         state.next_idx = (idx + 1) % len;
                     }
-                    Action::Run { picked, initial, reply }
-                } 
+                    Action::Run {
+                        picked,
+                        initial,
+                        reply,
+                    }
+                }
                 ManagerMsg::Stop { reply } => Action::Stop { reply },
             };
 
             async move {
                 match action {
-                    Action::Run { picked, initial, reply } => {
+                    Action::Run {
+                        picked,
+                        initial,
+                        reply,
+                    } => {
                         let mut outputs = Vec::new();
                         let mut current = initial;
                         for agent in picked {
@@ -505,7 +589,7 @@ pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, 
                                     outputs.push(out);
                                 }
                                 Err(_e) => {
-                                    let _ = reply.send(outputs); 
+                                    let _ = reply.send(outputs);
                                     return ActorCtrl::Continue;
                                 }
                             }
@@ -525,31 +609,34 @@ pub async fn spawn_group_manager(agents: Vec<EchoAgentHandle>, capacity: usize, 
     Ok(GroupManagerHandle {
         core: HandleCore::new(sup, DEFAULT_TIMEOUT, SendPolicy::Backpressure),
     })
-} 
+}
 
-pub async fn spawn_echo_agent(name: &str, capacity: usize, policy: RestartPolicy) -> Result<EchoAgentHandle, ActorError> {
+pub async fn spawn_echo_agent(
+    name: &str,
+    capacity: usize,
+    policy: RestartPolicy,
+) -> Result<EchoAgentHandle, ActorError> {
     let name = name.to_string();
     let factory = move || {
-        let initial_echo_state = EchoState { name: name.clone(), turns: 0 };  
-        spawn_actor(
-            capacity,
-            initial_echo_state,
-            |state, msg| {
-                let ctrl = match msg {
-                    EchoAgentMsg::Respond { input, reply } => {
-                        state.turns += 1;
-                        let output = format!("{}[{}]: {}", state.name, state.turns, input);
-                        let _ = reply.send(output);
-                        ActorCtrl::Continue
-                    }
-                    EchoAgentMsg::Stop { reply } => {
-                        let _ = reply.send(());
-                        ActorCtrl::Stop
-                    }
-                };
-                async move { ctrl }
-            },
-        )   
+        let initial_echo_state = EchoState {
+            name: name.clone(),
+            turns: 0,
+        };
+        spawn_actor(capacity, initial_echo_state, |state, msg| {
+            let ctrl = match msg {
+                EchoAgentMsg::Respond { input, reply } => {
+                    state.turns += 1;
+                    let output = format!("{}[{}]: {}", state.name, state.turns, input);
+                    let _ = reply.send(output);
+                    ActorCtrl::Continue
+                }
+                EchoAgentMsg::Stop { reply } => {
+                    let _ = reply.send(());
+                    ActorCtrl::Stop
+                }
+            };
+            async move { ctrl }
+        })
     };
     let sup = Supervisor::start(factory, policy).await?;
     Ok(EchoAgentHandle {
@@ -617,7 +704,7 @@ mod tests {
         let v3 = handle.get().await.unwrap();
         assert_eq!(v3, 5);
 
-        let v4 = handle2.add(-1).await.unwrap();   
+        let v4 = handle2.add(-1).await.unwrap();
         assert_eq!(v4, 4);
 
         let v5 = handle2.get().await.unwrap();
@@ -632,7 +719,8 @@ mod tests {
             let _ = msg;
             *state += 1;
             std::future::ready(ActorCtrl::Stop)
-        }).unwrap();
+        })
+        .unwrap();
         tx.send(1).await.unwrap();
         drop(tx);
         let exit = join.await.unwrap();
@@ -641,29 +729,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_actor_exit_reason_all_senders_dropped() {
-        let (tx, join) = spawn_actor(8, (), |_, _msg: ()| std::future::ready(ActorCtrl::Continue)).unwrap();
+        let (tx, join) =
+            spawn_actor(8, (), |_, _msg: ()| std::future::ready(ActorCtrl::Continue)).unwrap();
         drop(tx);
         let exit = join.await.unwrap();
         assert_eq!(exit, ExitReason::AllSendersDropped);
     }
-    
+
     #[tokio::test]
     async fn test_override_path_works() {
         let handle = spawn_counter(8, RestartPolicy::Never).await.unwrap();
-        let v1 = handle.get_with_timeout(Duration::from_millis(50)).await.unwrap();
+        let v1 = handle
+            .get_with_timeout(Duration::from_millis(50))
+            .await
+            .unwrap();
         assert_eq!(v1, 0);
         let _ = handle.stop().await;
-
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_timeout_triggered() {
         let handle = spawn_counter(8, RestartPolicy::Never).await.unwrap();
 
-        let fut = handle.request_with_timeout(
-            Some(Duration::from_millis(10)),
-            |reply| CounterMessage::DelayGet { delay: Duration::from_millis(50), reply },
-        );
+        let fut = handle.request_with_timeout(Some(Duration::from_millis(10)), |reply| {
+            CounterMessage::DelayGet {
+                delay: Duration::from_millis(50),
+                reply,
+            }
+        });
 
         tokio::time::advance(Duration::from_millis(11)).await;
         let res = fut.await;
@@ -672,14 +765,19 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_restarts_once_on_panic() {
-        let handle = spawn_counter(8, RestartPolicy::MaxRetries { n: 1 }).await.unwrap();
+        let handle = spawn_counter(8, RestartPolicy::MaxRetries { n: 1 })
+            .await
+            .unwrap();
         let _v1 = handle.add(10).await;
         let _v2 = handle.crash_now().await;
-        
+
         let mut v3 = None;
         for _ in 0..10 {
             match handle.add(1).await {
-                Ok(v) => { v3 = Some(v); break; }
+                Ok(v) => {
+                    v3 = Some(v);
+                    break;
+                }
                 Err(ActorError::SendFailed) => tokio::task::yield_now().await,
                 Err(e) => panic!("unexpected error: {e:?}"),
             }
@@ -693,14 +791,16 @@ mod tests {
         let handle = spawn_counter(8, RestartPolicy::Never).await.unwrap();
         let _v1 = handle.add(10).await;
         let _v2 = handle.crash_now().await;
-        
+
         let v3 = handle.add(1).await;
         assert!(matches!(v3, Err(ActorError::SendFailed)));
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_stops_restarting_after_max_retries() {
-        let handle = spawn_counter(8, RestartPolicy::MaxRetries { n: 1 }).await.unwrap();
+        let handle = spawn_counter(8, RestartPolicy::MaxRetries { n: 1 })
+            .await
+            .unwrap();
         let _ = handle.crash_now().await;
 
         let mut v3 = None;
@@ -735,13 +835,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_ff_returns_mailboxfull_when_q_full() {
         let counter = spawn_counter(1, RestartPolicy::Never).await.unwrap();
-        let handle = counter.with_policy(SendPolicy::FailFast);    
+        let handle = counter.with_policy(SendPolicy::FailFast);
         // send Hold
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
 
         let sender = counter.core.sup.sender().await; // tests can access private fields
-        sender.send(CounterMessage::Hold { started: started_tx, release: release_rx }).await.unwrap();
+        sender
+            .send(CounterMessage::Hold {
+                started: started_tx,
+                release: release_rx,
+            })
+            .await
+            .unwrap();
 
         // wait until actor is blocked
         let _ = started_rx.await;
@@ -749,7 +855,10 @@ mod tests {
         // enqueue one request (fills queue)
         let (dummy_tx, _dummy_rx) = oneshot::channel();
         sender
-            .send(CounterMessage::Add { delta: 1, reply: dummy_tx })
+            .send(CounterMessage::Add {
+                delta: 1,
+                reply: dummy_tx,
+            })
             .await
             .unwrap();
 
@@ -768,7 +877,10 @@ mod tests {
         let (release_tx, release_rx) = oneshot::channel();
         let sender = counter.core.sup.sender().await; // tests can access private fields
         sender
-            .send(CounterMessage::Hold { started: started_tx, release: release_rx })
+            .send(CounterMessage::Hold {
+                started: started_tx,
+                release: release_rx,
+            })
             .await
             .unwrap();
 
@@ -778,13 +890,14 @@ mod tests {
         // Fill the queue deterministically (capacity = 1)
         let (dummy_tx, _dummy_rx) = oneshot::channel();
         sender
-            .send(CounterMessage::Add { delta: 1, reply: dummy_tx })
+            .send(CounterMessage::Add {
+                delta: 1,
+                reply: dummy_tx,
+            })
             .await
             .unwrap();
         let h2 = counter.clone();
-        let pending = tokio::spawn(async move {
-            h2.add(1).await
-        });
+        let pending = tokio::spawn(async move { h2.add(1).await });
         let _ = release_tx.send(());
         let res = pending.await.unwrap();
         assert!(res.is_ok());
@@ -803,7 +916,10 @@ mod tests {
 
         let sender = counter.core.sup.sender().await;
         sender
-            .send(CounterMessage::Hold { started: started_tx, release: release_rx })
+            .send(CounterMessage::Hold {
+                started: started_tx,
+                release: release_rx,
+            })
             .await
             .unwrap();
 
@@ -812,14 +928,15 @@ mod tests {
         // Fill queue deterministically
         let (dummy_tx, _dummy_rx) = oneshot::channel();
         sender
-            .send(CounterMessage::Add { delta: 1, reply: dummy_tx })
+            .send(CounterMessage::Add {
+                delta: 1,
+                reply: dummy_tx,
+            })
             .await
             .unwrap();
 
         // Backpressure handle: will block
-        let pending = tokio::spawn(async move {
-            counter.add(1).await
-        });
+        let pending = tokio::spawn(async move { counter.add(1).await });
 
         // FailFast handle: should error immediately
         let res = h2.add(1).await;
@@ -833,9 +950,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_round_robin_order_is_correct() {
-        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never).await.unwrap();
-        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never).await.unwrap();
-        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never).await.unwrap();
+        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never)
+            .await
+            .unwrap();
+        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never)
+            .await
+            .unwrap();
+        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never)
+            .await
+            .unwrap();
 
         let transcript = mgr.run("hello", 4).await.unwrap();
 
@@ -848,9 +971,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_chaining_correctness() {
-        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never).await.unwrap();
-        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never).await.unwrap();
-        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never).await.unwrap();
+        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never)
+            .await
+            .unwrap();
+        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never)
+            .await
+            .unwrap();
+        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never)
+            .await
+            .unwrap();
 
         let transcript = mgr.run("hello", 4).await.unwrap();
 
@@ -862,9 +991,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_manager_stop_ends_manager() {
-        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never).await.unwrap();
-        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never).await.unwrap();
-        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never).await.unwrap();
+        let alice = spawn_echo_agent("alice", 8, RestartPolicy::Never)
+            .await
+            .unwrap();
+        let bob = spawn_echo_agent("bob", 8, RestartPolicy::Never)
+            .await
+            .unwrap();
+        let mgr = spawn_group_manager(vec![alice, bob], 8, RestartPolicy::Never)
+            .await
+            .unwrap();
 
         let stop_res = mgr.stop().await;
         assert!(stop_res.is_ok());

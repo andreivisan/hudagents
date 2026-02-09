@@ -2,9 +2,12 @@
 /**************** STRUCTS & ENUMS DEFS ****************/
 /******************************************************/
 
-struct WorkflowId;
+use std::collections::HashMap;
 
-struct NodeId(pub usize);
+pub struct WorkflowId;
+
+#[derive(Clone, Debug)]
+pub struct NodeId(pub usize);
 
 enum NodeKind {
     Tool,
@@ -13,4 +16,23 @@ enum NodeKind {
     Custom,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Plan,
+    Run,
+    Done,
+}
 
+#[derive(Clone, Debug)]
+pub enum FlowAtom {
+    PhaseIs(Phase),
+    HasOutput(NodeId),
+    Flag(&'static str),
+    VarLt { key: &'static str, n: i64 },
+}
+
+pub struct WorkflowCtx {
+    pub outputs: HashMap<NodeId, String>,
+    pub vars_i64l: HashMap<&'static str, i64>,
+    pub flags: HashMap<&'static str, bool>,
+}
