@@ -1,5 +1,9 @@
 use std::collections::VecDeque;
 
+/******************************************************/
+/*********** STRUCTS, TRAITS, ENUMS, IMPLS ************/
+/******************************************************/
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State { Locked, Unlocked }
 
@@ -17,27 +21,68 @@ struct Ctx {
 }
 
 #[derive(Clone, Debug)]
-enum Cond {
+pub enum Cond<A> {
     Always,
-    StateIs(State),
-    CoinsLt(u32),
-    And(Box<Cond>, Box<Cond>),
-    Or(Box<Cond>, Box<Cond>),
-    Not(Box<Cond>)
+    Atom(A),
+    And(Box<Cond<A>>, Box<Cond<A>>),
+    Or(Box<Cond<A>>, Box<Cond<A>>),
+    Not(Box<Cond<A>>)
 }
 
-impl Cond {
-    fn eval(&self, state: State, ctx: &Ctx) -> bool {
+pub trait AtomEval<S, C> {
+    fn eval(&self, state: &S, ctx: &C) -> bool;
+}
+
+impl<A> Cond<A> {
+    pub fn eval<S, C>(&self, state: &S, ctx: &C) -> bool 
+    where
+        A: AtomEval<S, C>
+    {
         match self {
             Cond::Always => true,
-            Cond::StateIs(s) => state == *s,
-            Cond::CoinsLt(n) => ctx.coins < *n,
-            Cond::And(a, b) => a.eval(state, ctx) && b.eval(state, ctx),
-            Cond::Or(a, b) => a.eval(state, ctx) || b.eval(state, ctx),
-            Cond::Not(a) => !a.eval(state, ctx)
-        } 
+            Cond::Atom(a) => a.eval(state, ctx),
+            Cond::And(x, y) => x.eval(state, ctx) && y.eval(state, ctx),
+            Cond::Or(x, y) => x.eval(state, ctx) || y.eval(state, ctx),
+            Cond::Not(x) => !x.eval(state, ctx),
+        }
     }
 }
+
+#[derive(Clone, Debug)]
+pub enum CoinAtom {
+    StateIs(State),
+    CoinsLt(u32),    
+}
+
+impl AtomEval<State, Ctx> for CoinAtom {
+    fn eval(&self, state: &State, ctx: &Ctx) -> bool {
+        match self {
+            CoinAtom::StateIs(s) => state == s,
+            CoinAtom::CoinsLt(n) => ctx.coins < *n,
+        }
+    }
+}
+
+pub type CoindCond = Cond<CoinAtom>;
+
+enum StopReason {
+    CycleDetected,
+    NoProgress,
+    HitMaxPasses,
+    ExhaustedPassViews,
+}
+
+struct PassView<'a, 'b, S: 'a, C: 'b> { state: &'a S, ctx: &'b C }
+
+struct PassPlan {
+    topo_order: Vec<usize>,
+    enabled_per_pass: Vec<Vec<usize>>,
+    stop_reason: StopReason,
+}
+
+/******************************************************/
+/************************ API *************************/
+/******************************************************/
 
 fn step(state: State, event: Event, ctx: &mut Ctx) -> (State, Vec<Action>) {
     let mut actions = Vec::new();
@@ -66,27 +111,21 @@ fn step(state: State, event: Event, ctx: &mut Ctx) -> (State, Vec<Action>) {
     (state, actions)
 }
 
-fn run(init_state: State, init_events: &[Event], ctx: &mut Ctx, max_steps: usize) -> (State, Vec<Action>, bool) {
-    let mut q: VecDeque<Event> = init_events.iter().copied().collect(); 
-    let mut state = init_state;
-    let mut step_counter: usize = 0;
-    let mut all_actions: Vec<Action> = Vec::new();
-    while step_counter < max_steps {
-        let Some(event) = q.pop_front() else { break;} ;
-        step_counter += 1;
-        let (next_step, action_for_step) = step(state, event, ctx);
-        for action in &action_for_step {
-            match action {
-                Action::EnqueueCoin => q.push_back(Event::Coin),
-                Action::EnqueuePush => q.push_back(Event::Push),
-                _ => {}
-            }
-        }
-        all_actions.extend(action_for_step);
-        state = next_step;
+fn run<S, C, A>(
+    state: &S, 
+    ctx: &C, 
+    topo_order: &[usize], 
+    enabled: &[Cond<A>]
+) -> Vec<usize> 
+where
+    A: AtomEval<S, C>
+{
+    let mut runnable = Vec::with_capacity(topo_order.len());
+    for &node in topo_order {
+        assert!(node < enabled.len());
+        if enabled[node].eval(state, ctx) { runnable.push(node); }
     }
-    let hit_cap: bool = step_counter == max_steps && !q.is_empty();
-    (state, all_actions, hit_cap) // last bool tells us if we hit max steps or not
+    runnable
 }
 
 fn kahn(num_nodes: usize, edges: &[(usize, usize)]) -> Vec<usize> {
@@ -153,6 +192,10 @@ fn run_passes(
     }
     (state, ctx, all_actions)
 }
+
+/******************************************************/
+/********************* UNIT TESTS *********************/
+/******************************************************/
 
 #[cfg(test)]
 mod tests {
