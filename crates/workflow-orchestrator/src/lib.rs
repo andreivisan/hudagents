@@ -1,13 +1,8 @@
+use std::collections::HashMap;
+
 /******************************************************/
 /**************** STRUCTS & ENUMS DEFS ****************/
 /******************************************************/
-
-use std::collections::HashMap;
-
-pub struct WorkflowId;
-
-#[derive(Clone, Debug)]
-pub struct NodeId(pub usize);
 
 enum NodeKind {
     Tool,
@@ -30,6 +25,11 @@ pub enum FlowAtom {
     Flag(&'static str),
     VarLt { key: &'static str, n: i64 },
 }
+
+pub struct WorkflowId;
+
+#[derive(Clone, Debug)]
+pub struct NodeId(pub usize);
 
 pub struct WorkflowCtx {
     pub outputs: HashMap<NodeId, String>,
