@@ -4,13 +4,6 @@ use std::collections::HashMap;
 /**************** STRUCTS & ENUMS DEFS ****************/
 /******************************************************/
 
-enum NodeKind {
-    Tool,
-    Agent,
-    GroupChat,
-    Custom,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
     Plan,
@@ -26,10 +19,24 @@ pub enum FlowAtom {
     VarLt { key: &'static str, n: i64 },
 }
 
-pub struct WorkflowId;
+enum NodeKind {
+    Tool,
+    Agent,
+    GroupChat,
+    Custom,
+}
 
 #[derive(Clone, Debug)]
 pub struct NodeId(pub usize);
+
+pub struct NodeSpec<A> {
+    pub id: NodeId,
+    pub kind: NodeKind,
+    pub config: NodeConfig,
+    pub enabled_if: Cond<A>,
+}
+
+pub struct WorkflowId;
 
 pub struct WorkflowCtx {
     pub outputs: HashMap<NodeId, String>,

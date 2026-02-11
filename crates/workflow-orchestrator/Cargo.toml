@@ -9,3 +9,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+fsm_dag = { path = "../fsm_dag" }
