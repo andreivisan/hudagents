@@ -118,6 +118,16 @@ pub struct WorkflowRuntimeState {
     pub last_output: Option<String>,
 }
 
+pub struct Registry {
+    pub agent_id: String,
+    pub tool_id: String,
+    pub manager_id: String,
+}
+
+pub struct EchoAgentHandle {
+    pub agent_id: String,
+}
+
 /******************************************************/
 /****************** Implementations *******************/
 /******************************************************/
@@ -130,5 +140,11 @@ impl AtomEval<WorkflowRuntimeState, WorkflowCtx> for FlowAtom {
             Self::Flag(name) => ctx.flags.get(name).copied().unwrap_or(false),
             Self::VarLt { key, n } => ctx.vars_i64.get(key).copied().unwrap_or(0) < *n,
         }
+    }
+}
+
+impl Registry {
+    pub fn get_agent(&self) -> EchoAgentHandle {
+
     }
 }
