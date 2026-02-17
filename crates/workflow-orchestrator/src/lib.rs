@@ -61,7 +61,7 @@ pub enum ToolArgValue {
 
 pub type ToolArgs = BTreeMap<String, ToolArgValue>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NodeId(pub usize);
 
 pub struct NodeSpec<A> {
@@ -109,7 +109,7 @@ pub struct WorkflowSpec<A> {
 
 pub struct WorkflowCtx {
     pub outputs: HashMap<NodeId, String>,
-    pub vars_i64l: HashMap<&'static str, i64>,
+    pub vars_i64: HashMap<&'static str, i64>,
     pub flags: HashMap<&'static str, bool>,
 }
 
@@ -123,10 +123,12 @@ pub struct WorkflowRuntimeState {
 /******************************************************/
 
 impl AtomEval<WorkflowRuntimeState, WorkflowCtx> for FlowAtom {
-    pub fn eval<WorkflowRuntimeState, WorkflowCtx>(&self, state: &WorkflowRuntimeState, ctx: &Work
-        ) -> bool
-    where
-        A: AtomEval<WorkflowRuntimeState, WorkflowCtx>,
-    {
+    fn eval(&self, state: &WorkflowRuntimeState, ctx: &WorkflowCtx) -> bool {
+        match self {
+            Self::PhaseIs(p) => state.phase == *p,
+            Self::HasOutput(node) => ctx.outputs.contains_key(&node),
+            Self::Flag(name) => ctx.flags.get(name).copied().unwrap_or(false),
+            Self::VarLt { key, n } => ctx.vars_i64.get(key).copied().unwrap_or(0) < *n,
+        }
     }
 }
