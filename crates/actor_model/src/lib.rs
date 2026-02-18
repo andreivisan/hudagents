@@ -21,6 +21,7 @@ use tokio::{
 
 #[derive(Debug)]
 pub enum ActorError {
+    ActorAlreadyPresent,
     InitError,
     InvalidCapacity,
     MailboxFull,
@@ -52,7 +53,6 @@ pub enum Termination {
     Clean(ExitReason),
     Panic,
 }
-
 #[derive(Clone, Copy, Debug)]
 pub enum SendPolicy {
     Backpressure,
@@ -497,6 +497,7 @@ enum ManagerMsg {
     },
 }
 
+#[derive(Clone)]
 pub struct GroupManagerHandle {
     core: HandleCore<ManagerMsg>,
 }

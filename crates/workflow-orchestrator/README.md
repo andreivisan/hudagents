@@ -21,7 +21,7 @@ let team  = spawn_group_manager(vec![alice.clone(), bob.clone()], 8, RestartPoli
 let mut reg = Registry::default();
 reg.insert_agent("alice", alice);
 reg.insert_agent("bob", bob);
-reg.insert_group("team", team);
+reg.insert_manager("team", team);
 
 // 3) Build workflow spec (nodes/edges/conditions)
 let wf: WorkflowSpec<FlowAtom> = build_demo_workflow();

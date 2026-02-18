@@ -9,4 +9,5 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+actor_model = { path = "../actor_model" }
 fsm_dag = { path = "../fsm_dag" }
