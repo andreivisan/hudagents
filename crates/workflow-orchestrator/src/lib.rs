@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, hash_map::Entry, HashMap};
+use std::collections::{BTreeMap, hash_map::Entry, HashMap, HashSet};
 use actor_model::{ActorError, EchoAgentHandle, GroupManagerHandle};
 use fsm_dag::{AtomEval, Cond};
 
@@ -60,6 +60,7 @@ pub enum ToolArgValue {
     Map(BTreeMap<String, ToolArgValue>),
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub enum WorkflowStop {
   Done,
   NoProgress,
@@ -87,35 +88,34 @@ pub struct EdgeSpec<A> {
 
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
-    agent_id: String,
-    input_from: InputRef,
-    output_to: OutputRef,
+    pub agent_id: String,
+    pub input_from: InputRef,
+    pub output_to: OutputRef,
 }
 
 #[derive(Clone, Debug)]
 pub struct ToolConfig {
-    tool_id: String,
-    args: ToolArgs,
-    input_from: InputRef,
-    output_to: OutputRef,
+    pub tool_id: String,
+    pub args: ToolArgs,
+    pub input_from: InputRef,
+    pub output_to: OutputRef,
 }
 
 #[derive(Clone, Debug)]
 pub struct GroupChatConfig {
-    manager_id: String,
-    max_turns: usize,
-    input_from: InputRef,
-    output_to: OutputRef,
+    pub manager_id: String,
+    pub max_turns: usize,
+    pub input_from: InputRef,
+    pub output_to: OutputRef,
 }
 
 pub struct WorkflowId;
 
 pub struct WorkflowSpec<A> {
-    nodes: Vec<NodeSpec<A>>,
-    edges: Vec<EdgeSpec<A>>,
+    pub nodes: Vec<NodeSpec<A>>,
+    pub edges: Vec<EdgeSpec<A>>,
 }
 
-#[derive(Default)]
 pub struct WorkflowCtx {
     pub outputs: HashMap<NodeId, String>,
     pub vars_i64: HashMap<&'static str, i64>,
@@ -127,16 +127,15 @@ pub struct WorkflowRuntimeState {
     pub last_output: Option<String>,
 }
 
-#[derive(Default)]
 pub struct Registry {
-    agents: HashMap<String, EchoAgentHandle>,
-    tools: HashMap<String, ToolImpl>,
-    managers: HashMap<String, GroupManagerHandle>,
+    pub agents: HashMap<String, EchoAgentHandle>,
+    pub tools: HashMap<String, ToolImpl>,
+    pub managers: HashMap<String, GroupManagerHandle>,
 }
 
 pub struct RunLimits {
     pub max_passes: usize,
-    pub max_nodex_per_pass: usize,
+    pub max_nodes_per_pass: usize,
 }
 
 type ToolImpl = fn(input: String, args: &ToolArgs, ctx: &mut WorkflowCtx) -> Result<String, ActorError>;
@@ -144,6 +143,35 @@ type ToolImpl = fn(input: String, args: &ToolArgs, ctx: &mut WorkflowCtx) -> Res
 /******************************************************/
 /****************** Implementations *******************/
 /******************************************************/
+
+impl Default for RunLimits {
+    fn default() -> Self {
+        Self {
+            max_passes: 3,
+            max_nodes_per_pass: 3,
+        }
+    }
+}
+
+impl Default for WorkflowCtx {
+    fn default() -> Self {
+        Self {
+            outputs: HashMap::new(),
+            vars_i64: HashMap::new(),
+            flags: HashMap::new(),
+        }
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            agents: HashMap::new(),
+            tools: HashMap::new(),
+            managers: HashMap::new(),
+        }
+    }
+}
 
 impl AtomEval<WorkflowRuntimeState, WorkflowCtx> for FlowAtom {
     fn eval(&self, state: &WorkflowRuntimeState, ctx: &WorkflowCtx) -> bool {
@@ -223,3 +251,22 @@ impl Registry {
             .ok_or_else(|| ActorError::InitError)
     }
 }
+
+/******************************************************/
+/********************** Workers ***********************/
+/******************************************************/
+
+fn validate_workflow_spec<A>(spec: &WorkflowSpec<A>) -> Result<(), WorkflowStop> {
+    let nodes_len = spec.nodes.len();
+    for (idx, node) in spec.nodes.iter().enumerate() {
+        if node.id.0 >= nodes_len { return Err(WorkflowStop::InvalidGraph); }
+        if node.id.0 != idx { return Err(WorkflowStop::InvalidGraph); }
+    }
+    for edge in &spec.edges {
+        if edge.from.0 >= nodes_len || edge.to.0 >= nodes_len {
+            return Err(WorkflowStop::InvalidGraph);
+        }
+    }
+    Ok(())
+}
+

@@ -27,7 +27,7 @@ reg.insert_manager("team", team);
 let wf: WorkflowSpec<FlowAtom> = build_demo_workflow();
 
 // 4) Run workflow
-let mut ctx = WorkflowCtx::new();
+let mut ctx = WorkflowCtx::default();
 let final_out = run_workflow(&wf, &reg, "hello".to_string(), &mut ctx, RunLimits::default()).await?;
 println!("{final_out}");
 ```
