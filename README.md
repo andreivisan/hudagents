@@ -1,76 +1,136 @@
-# HUDAGENTS
+# HudAgents
 
-Most beautifuly and efficiently written AI Agents Framework centered around Computer Vision.
+Rust AI agent framework for privacy-aware, computer-vision-first workflows, combining DAG orchestration, FSM control flow, 
+actor-style execution, and local/cloud model routing.
 
-## Principles
+> Status: experimental / pre-alpha. The core graph primitives and local-model building blocks exist, but APIs and docs are 
+still evolving.
 
-My development for hardware and software has the following MUSTS:
-- minimal dependencies for memory efficiency (like we said above if it takes too much code we will use dependencies)
-- elegant with as little as possible code to solve problems
-- speed is vital
-- security is vital
-- 0 bugs is vital
-- privacy is vital
-- beauty is essential
+## Why HudAgents?
 
-## Privacy first
+- Privacy-first local and cloud agents, with routing decisions made per agent.
+- Structured orchestration built around DAG execution, FSM-style control, and actor-like messaging.
+- Clear separation between stateless tools and stateful agents.
+- Built for computer vision, speech-to-text, and wearable AI workflows.
+- Correctness, reliability, privacy, and minimal dependencies are first-class goals.
 
-In order to protect user's privacy this framework support local AI Agents as well as Cloud AI Agents.
-For local AI agents documentation please see [Local Agents docs](https://github.com/andreivisan/hudagents/blob/main/crates/hudagents-local/README.md)
+## Workspace Overview
 
-## Architectural notes
+- `hudagents-core`: agent traits, context primitives, graph building blocks, and runtime foundations.
+- `hudagents-local`: local speech-to-text and vision backends.
+- `hudagents-tools`: CLI utilities for system inspection and Whisper model downloads.
+- `hudagents-capture`: local image and audio capture helpers for demos.
 
-### Runtime behavior
+## Quick Start
 
-1. **LangGraph** is using an explicit graph, **AutoGen** is using a conversation-driven model. 
-HudAgents builds a default task graph (suggested by an LLM ‘planner’ agent) from the user’s initial query. Users can then modify or extend this graph.
+Prerequisites:
 
-2. Currently the only type of memory supported is `**Short-Term Memory**` using a `**Context Queue**`.
+- Rust stable toolchain
+- `ffmpeg` for speech-to-text workflows
+- `Ollama` if you want to experiment with the local vision stack from `hudagents-local`
 
-### Agents characteristics
+```bash
+git clone https://github.com/hudward/hudagents
+cd hudagents
+cargo build
+cargo test
+cargo run -p hudagents-tools -- sysinfo
+```
 
-1. Each agent can maintain its own context queue of recent messages and use a shared memory if they work in a team. Future versions will use a vector database.
+To download a Whisper model after checking your system:
 
-2. **Local vs Remote agents** - HudAgents will let use choose per agent whether to use a local model or a cloud service. That way the user has control over what data is shared and what stays local.
+```bash
+cargo run -p hudagents-tools -- download --model tiny.en
+```
 
-3. Each agent in HudAgents can be designed as a modular component with a defined role as one of the two:
-    - **Stateless tools** (pure functions: “transcribe this”, “detect objects”).
-    - **Stateful agents** (have memory, persona, internal goals).
+## Minimal Example
 
-### Data model
+The graph API is still evolving, but the current core already supports building layered DAG execution plans:
 
-Starting with future versions:
-    - `protobuf` will be used for message passing and graph structure.
-    - `JSON` will be used for optional debug export or external logs.
+```rust
+use hudagents_core::agent::{Agent, AgentInput, AgentOutput, HAAgentError};
+use hudagents_core::graph::{GraphBuilder, HAGraphError};
+use std::sync::Arc;
 
-Currently internal Rust structs will be used.
+struct EchoAgent;
 
-### Orchestration
+impl Agent for EchoAgent {
+    fn id(&self) -> &str {
+        "echo"
+    }
 
-- Using a DAG implementing Khan's algorithm to decided the order of execution and parallelism.
-- Using a FSM to create cycles of execution in a DAG.
-- Using a modified Actor Model for messaging between agents:
-    1. Task-Handle split with Message enums to define the "protocol" of interaction.
-    2. Bounded Mailboxes and Backpressure to support heavy load.
-    3. Group chat and Manager Actors: Round-Robin for local models (to still have speed) and LLM-based selector for the cloud option.
+    fn call(&self, input: AgentInput) -> Result<AgentOutput, HAAgentError> {
+        Ok(match input {
+            AgentInput::Text(text) => AgentOutput::FinalAnswer(text),
+            _ => AgentOutput::FinalAnswer("unsupported input".to_string()),
+        })
+    }
+}
 
-### Tooling & Visualisation
+fn main() -> Result<(), HAGraphError> {
+    let worker = Arc::new(EchoAgent);
 
-- HudAgents will include introspection capabilities to trace and visualize the agent behaviors at different verbosity levels.
-- In practice, this means implementing a logging or debug flag (e.g. a GRAPH and DEBUG level) that, when enabled, outputs the internal decision graph or conversation trace to the console.
-- Besides logging, we might allow exporting the agent interaction graph (perhaps as a data structure or even a Graphviz diagram) at runtime when debugging.
-- Future versions will include a GUI for the user to visualise the Graph flow.
-- To make HudAgents user-friendly, a builder pattern for constructing agent graphs is preferred.
+    let mut builder = GraphBuilder::new();
+    let ingest = builder.add_node("ingest", worker.clone());
+    let respond = builder.add_node("respond", worker);
 
-### Failure handling
+    builder.add_edge(ingest, respond)?;
 
-- We will start with retry + configurable failure behavior.
-- HudAgents will allow the user to configure how failures are handled, rather than baking in one policy.
-- This means exposing settings like: max retries, fallback actions, or human intervention triggers.
-- Built-in Error Recovery: On the framework side, we’ll incorporate some automatic error-handling capabilities so that common failures don’t always need human intervention. In the future this will also include time-travel debugging, meaning the system can backtrack to a prior state if something goes wrong.
+    let graph = builder.build()?;
+    assert_eq!(graph.layers.len(), 2);
 
-## Future Versions
+    Ok(())
+}
+```
 
-- Google's Pregel algorithm to support vertex parallel execution and support cycles. At the moment we are using Kahn's algorithm for parallel processing as no loops are supported at the moment. (Or maybe just use explicit loop constructs).
-- Pre-processed flows based on functionality: for example an agentic flow optimised for coding, another one for studying.
-- Pre-processed flows based on vendor: flows that are using the OpenAI ecosystem, or Anthropic, or just a gathering of the best open source AI agents. 
+## Core Concepts
+
+### DAG + FSM orchestration
+
+HudAgents uses a graph-oriented execution model for dependency ordering and parallelism, with FSM-style control for retries,
+skips, and other non-linear runtime decisions.
+
+### Tools vs stateful agents
+
+HudAgents distinguishes between narrow stateless tools and longer-lived stateful agents that carry recent context and 
+role-specific behavior.
+
+### Local vs cloud privacy model
+
+HudAgents is designed for per-agent local/cloud routing so privacy decisions stay explicit and sensitive workflows can stay
+local when needed.
+
+### Failure handling and observability
+
+Failure handling and introspection are part of the framework design, not afterthoughts. Please refer to the architecture docs.
+
+## Project Status
+
+HudAgents is still early. The repository already contains graph primitives, local-agent building blocks, and a 
+model-management CLI, but it is not yet a polished end-user framework release.
+
+Current state:
+
+- Core graph construction and cycle detection exist in `hudagents-core`.
+- Local Whisper and local-model integration work is underway in `hudagents-local`.
+- The first practical user entry point today is `hudagents-tools`.
+
+## Documentation
+
+- [hudagents-core](crates/hudagents-core/README.md)
+- [hudagents-local](crates/hudagents-local/README.md)
+- [hudagents-tools](crates/hudagents-tools/README.md)
+
+Planned docs:
+
+- Architecture
+- Roadmap
+- Examples
+
+## Contributing
+
+Contributions are not yet opened.
+
+## License
+
+Licensed under `MIT OR Apache-2.0`.
