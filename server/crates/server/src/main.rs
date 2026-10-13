@@ -1,7 +1,10 @@
 use std::{
     env,
     io::{Error, ErrorKind, Result},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use axum::{
@@ -14,6 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use hudagents_proto::BridgeMessage;
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 
@@ -21,6 +25,7 @@ use tokio::sync::broadcast::{self, error::RecvError};
 struct AppState {
     messages: broadcast::Sender<String>,
     phone_token: Arc<str>,
+    next_seq: Arc<AtomicU64>,
 }
 
 #[derive(Deserialize)]
@@ -30,9 +35,17 @@ struct PhoneQuery {
 
 async fn say(State(state): State<AppState>, request_body: String) -> StatusCode {
     tracing::info!(body_bytes = request_body.len(), "Received say request");
-    match state.messages.send(request_body) {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    let seq = state.next_seq.fetch_add(1, Ordering::Relaxed);
+    let bridge_message = BridgeMessage::text(seq, request_body);
+    match serde_json::to_string(&bridge_message) {
+        Ok(json_string) => match state.messages.send(json_string) {
+            Ok(_) => StatusCode::NO_CONTENT,
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        },
+        Err(error) => {
+            tracing::error!(%error, "Failed to serialize message");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 
@@ -108,6 +121,7 @@ async fn main() -> Result<()> {
     let app_state = AppState {
         messages: tx,
         phone_token: phone_token.into(),
+        next_seq: Arc::new(AtomicU64::new(1)),
     };
     let app = Router::new()
         .route("/say", post(say))
