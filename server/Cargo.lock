@@ -267,7 +267,9 @@ name = "hudagents-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hudagents-proto",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

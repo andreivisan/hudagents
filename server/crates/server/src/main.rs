@@ -6,12 +6,16 @@ use std::{
 
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::{self, error::RecvError};
 
 #[derive(Clone)]
 struct AppState {
@@ -32,11 +36,56 @@ async fn say(State(state): State<AppState>, request_body: String) -> StatusCode 
     }
 }
 
-async fn phone(State(state): State<AppState>, phone_query: Query<PhoneQuery>) -> StatusCode {
+async fn phone(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    phone_query: Query<PhoneQuery>,
+) -> Response {
     if phone_query.token.as_deref() != Some(state.phone_token.as_ref()) {
-        return StatusCode::UNAUTHORIZED;
+        return StatusCode::UNAUTHORIZED.into_response();
     }
-    StatusCode::NO_CONTENT
+    let receiver = state.messages.subscribe();
+    ws.on_upgrade(move |socket| handle_phone_socket(socket, receiver))
+}
+
+async fn handle_phone_socket(mut socket: WebSocket, mut receiver: broadcast::Receiver<String>) {
+    tracing::info!("Web socket connected");
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) => {
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "WebSocket receive failed");
+                        break;
+                    }
+                    None => {
+                        break;
+                    }
+                };
+            }
+            outgoing = receiver.recv() => {
+                match outgoing {
+                    Ok(text) => {
+                        if let Err(error) = socket.send(Message::Text(text.into())).await {
+                            tracing::warn!(%error, "WebSocket send failed");
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped=skipped, "Total skipped");
+                    }
+                    Err(RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    tracing::info!("Web socket disconnected");
 }
 
 #[tokio::main]
