@@ -26,6 +26,15 @@ impl BridgeMessage {
             body,
         }
     }
+
+    pub fn status(seq: u64, body: String) -> Self {
+        Self {
+            msg_type: MessageType::Status,
+            seq,
+            id: Uuid::new_v4(),
+            body,
+        }
+    }
 }
 
 #[cfg(test)]
