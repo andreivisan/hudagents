@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -19,7 +20,12 @@ use axum::{
 };
 use hudagents_proto::BridgeMessage;
 use serde::Deserialize;
-use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::{
+    sync::broadcast::{self, error::RecvError},
+    time::timeout,
+};
+
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct AppState {
@@ -49,12 +55,16 @@ async fn say(State(state): State<AppState>, request_body: String) -> StatusCode 
     }
 }
 
+fn token_matches(provided: Option<&str>, expected: &str) -> bool {
+    provided == Some(expected)
+}
+
 async fn phone(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     phone_query: Query<PhoneQuery>,
 ) -> Response {
-    if phone_query.token.as_deref() != Some(state.phone_token.as_ref()) {
+    if !token_matches(phone_query.token.as_deref(), state.phone_token.as_ref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let receiver = state.messages.subscribe();
@@ -62,7 +72,7 @@ async fn phone(
 }
 
 async fn handle_phone_socket(mut socket: WebSocket, mut receiver: broadcast::Receiver<String>) {
-    tracing::info!("Web socket connected");
+    tracing::info!("Phone connected");
     loop {
         tokio::select! {
             incoming = socket.recv() => {
@@ -83,9 +93,20 @@ async fn handle_phone_socket(mut socket: WebSocket, mut receiver: broadcast::Rec
             outgoing = receiver.recv() => {
                 match outgoing {
                     Ok(text) => {
-                        if let Err(error) = socket.send(Message::Text(text.into())).await {
-                            tracing::warn!(%error, "WebSocket send failed");
-                            break;
+                        match timeout(
+                            SEND_TIMEOUT,
+                            socket.send(Message::Text(text.into())),
+                         ).await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "WebSocket send failed");
+                                break;
+                            }
+                            Err(_) => {
+                                tracing::warn!("WebSocket send timeout");
+                                break;
+                            }
                         }
                     }
                     Err(RecvError::Lagged(skipped)) => {
@@ -98,7 +119,44 @@ async fn handle_phone_socket(mut socket: WebSocket, mut receiver: broadcast::Rec
             }
         }
     }
-    tracing::info!("Web socket disconnected");
+    tracing::info!("Phone disconnected");
+}
+
+async fn device(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(handle_device_socket)
+}
+
+async fn handle_device_socket(mut socket: WebSocket) {
+    tracing::info!("Device connected");
+    while let Some(message) = socket.recv().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                tracing::info!(
+                    message_type = "text",
+                    body_bytes = text.len(),
+                    "Device message received"
+                );
+            }
+            Ok(Message::Binary(bytes)) => {
+                tracing::info!(
+                    message_type = "bytes",
+                    body_bytes = bytes.len(),
+                    "Device message received"
+                );
+            }
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                continue;
+            }
+            Ok(Message::Close(_)) => {
+                break;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Error handling device");
+                break;
+            }
+        }
+    }
+    tracing::info!("Device disconnected");
 }
 
 #[tokio::main]
@@ -126,10 +184,119 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/say", post(say))
         .route("/phone", get(phone))
+        .route("/device", get(device))
         .with_state(app_state);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     let address = listener.local_addr()?;
     tracing::info!(%address, "Server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_validation_rejects_missing_token() {
+        assert!(!token_matches(None, "test-token"));
+    }
+
+    #[test]
+    fn token_validation_rejects_incorrect_token() {
+        for provided in [
+            "wrong",
+            "TEST-TOKEN",
+            "test-token ",
+            "test",
+            "test-token-extra",
+        ] {
+            assert!(!token_matches(Some(provided), "test-token"));
+        }
+    }
+
+    #[test]
+    fn token_validation_rejects_empty_token() {
+        assert!(!token_matches(Some(""), "test-token"));
+    }
+
+    #[test]
+    fn token_validation_accepts_correct_token() {
+        assert!(token_matches(Some("test-token"), "test-token"));
+    }
+
+    fn test_state() -> AppState {
+        let (messages, receiver) = broadcast::channel(64);
+        drop(receiver);
+        AppState {
+            messages,
+            phone_token: Arc::from("test-token"),
+            next_seq: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    #[tokio::test]
+    async fn say_returns_unavailable_without_subscribers() {
+        assert_eq!(
+            say(State(test_state()), "hello".into()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn say_publishes_json_with_original_body_and_unique_ids() {
+        let state = test_state();
+        let mut receiver = state.messages.subscribe();
+        let body = "Hello \"glasses\"!\nSalut 👓";
+        let mut previous_id = None;
+
+        for expected_seq in 1..=2 {
+            assert_eq!(
+                say(State(state.clone()), body.into()).await,
+                StatusCode::NO_CONTENT
+            );
+            let json = receiver.try_recv().expect("message should be published");
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["type"], "text");
+            assert_eq!(value["seq"], expected_seq);
+            assert_eq!(value["body"], body);
+            assert!(value.get("msg_type").is_none());
+
+            let message: BridgeMessage = serde_json::from_str(&json).unwrap();
+            assert!(!message.id.is_nil());
+            assert_ne!(previous_id, Some(message.id));
+            previous_id = Some(message.id);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn say_delivers_identical_json_to_each_subscriber() {
+        let state = test_state();
+        let mut first = state.messages.subscribe();
+        let mut second = state.messages.subscribe();
+        assert_eq!(
+            say(State(state), "hello".into()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(first.try_recv().unwrap(), second.try_recv().unwrap());
+    }
+
+    #[tokio::test]
+    async fn say_returns_unavailable_after_last_subscriber_disconnects() {
+        let state = test_state();
+        let receiver = state.messages.subscribe();
+        assert_eq!(
+            say(State(state.clone()), "connected".into()).await,
+            StatusCode::NO_CONTENT
+        );
+        drop(receiver);
+        assert_eq!(
+            say(State(state), "disconnected".into()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
