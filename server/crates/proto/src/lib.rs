@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod device;
+
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = 4 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageType {

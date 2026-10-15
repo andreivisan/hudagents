@@ -18,7 +18,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use hudagents_proto::BridgeMessage;
+use hudagents_proto::{
+    BridgeMessage, MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION,
+    device::{DeviceId, DeviceMessage, ErrorCode, ServerMsg},
+};
 use serde::Deserialize;
 use tokio::{
     sync::broadcast::{self, error::RecvError},
@@ -37,12 +40,6 @@ struct AppState {
 #[derive(Deserialize)]
 struct PhoneQuery {
     token: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DeviceMessage {
-    #[serde(rename = "type")]
-    kind: String,
 }
 
 async fn say(State(state): State<AppState>, request_body: String) -> StatusCode {
@@ -129,59 +126,51 @@ async fn handle_phone_socket(mut socket: WebSocket, mut receiver: broadcast::Rec
 }
 
 async fn device(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| handle_device_socket(socket, state))
+    ws.max_message_size(MAX_CONTROL_MESSAGE_BYTES)
+        .max_frame_size(MAX_CONTROL_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_device_socket(socket, state))
+}
+
+fn accept_hello(message: DeviceMessage) -> std::result::Result<DeviceId, ServerMsg> {
+    match message {
+        DeviceMessage::Hello {
+            protocol_version,
+            device_id,
+        } => {
+            if protocol_version == PROTOCOL_VERSION {
+                Ok(device_id)
+            } else {
+                Err(ServerMsg::error(
+                    ErrorCode::UnsupportedVersion,
+                    format!("Expected protocol version {PROTOCOL_VERSION}, got {protocol_version}"),
+                ))
+            }
+        }
+    }
 }
 
 async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
     tracing::info!("Device connected");
+    let mut accepted_device: Option<DeviceId> = None;
     while let Some(message) = socket.recv().await {
-        match message {
+        // First decide the protocol outcome; sending and state changes happen below.
+        let outcome = match message {
             Ok(Message::Text(text)) => {
                 tracing::info!(
                     message_type = "text",
                     body_bytes = text.len(),
                     "Device message received"
                 );
-                match serde_json::from_str::<DeviceMessage>(text.as_str()) {
-                    Ok(DeviceMessage { kind }) => {
-                        if kind == "hello" {
-                            let seq = state.next_seq.fetch_add(1, Ordering::Relaxed);
-                            let status_message =
-                                BridgeMessage::status(seq, "Camera unit online".into());
-                            match serde_json::to_string(&status_message) {
-                                Ok(json_msg) => {
-                                    if state.messages.send(json_msg).is_err() {
-                                        tracing::debug!(
-                                            "Status not broadcast: no display subscribers"
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::error!(%error, "Failed to serialize status message");
-                                }
-                            };
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "Invalid device message");
-                        continue;
-                    }
-                };
-                match timeout(
-                    SEND_TIMEOUT,
-                    socket.send(Message::Text(r#"{"type":"welcome"}"#.into())),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "Device welcome send failed");
-                        break;
-                    }
-                    Err(_) => {
-                        tracing::warn!("Device welcome send timed out");
-                        break;
-                    }
+                match DeviceMessage::from_json(text.as_str()) {
+                    Err(_) => Err(ServerMsg::error(
+                        ErrorCode::InvalidMessage,
+                        "Expected a valid device hello".into(),
+                    )),
+                    Ok(_) if accepted_device.is_some() => Err(ServerMsg::error(
+                        ErrorCode::UnexpectedMessage,
+                        "Device has already completed its hello".into(),
+                    )),
+                    Ok(message) => accept_hello(message),
                 }
             }
             Ok(Message::Binary(bytes)) => {
@@ -190,6 +179,10 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                     body_bytes = bytes.len(),
                     "Device message received"
                 );
+                Err(ServerMsg::error(
+                    ErrorCode::InvalidMessage,
+                    "Expected a JSON text message; binary messages are not supported".into(),
+                ))
             }
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
                 continue;
@@ -201,6 +194,58 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                 tracing::warn!(%error, "Error handling device");
                 break;
             }
+        };
+
+        let (reply, device_id) = match outcome {
+            Ok(id) => (ServerMsg::welcome(), Some(id)),
+            Err(error_reply) => (error_reply, None),
+        };
+        let json = match reply.to_json() {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::error!(%error, "Failed to serialize device reply");
+                break;
+            }
+        };
+        match timeout(SEND_TIMEOUT, socket.send(Message::Text(json.into()))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "Device reply send failed");
+                break;
+            }
+            Err(_) => {
+                tracing::warn!("Device reply send timed out");
+                break;
+            }
+        }
+
+        // Only a successfully sent welcome commits the handshake and announces the device.
+        if let Some(id) = device_id {
+            tracing::info!(device_id = id.as_str(), "Device hello accepted");
+            accepted_device = Some(id);
+            let seq = state.next_seq.fetch_add(1, Ordering::Relaxed);
+            let status = BridgeMessage::status(seq, "Camera unit online".into());
+            match serde_json::to_string(&status) {
+                Ok(json) => {
+                    if state.messages.send(json).is_err() {
+                        tracing::debug!("Status not broadcast: no display subscribers");
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Failed to serialize status message");
+                }
+            }
+        } else {
+            match timeout(SEND_TIMEOUT, socket.send(Message::Close(None))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Device close failed");
+                }
+                Err(_) => {
+                    tracing::warn!("Device close timed out");
+                }
+            }
+            break;
         }
     }
     tracing::info!("Device disconnected");
@@ -239,6 +284,9 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod device_tests;
 
 #[cfg(test)]
 mod tests {
