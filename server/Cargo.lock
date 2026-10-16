@@ -322,6 +322,7 @@ name = "hudagents-device"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "hudagents-proto",
  "tokio",
  "tokio-tungstenite 0.30.0",
 ]

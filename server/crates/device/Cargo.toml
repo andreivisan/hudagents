@@ -7,5 +7,6 @@ repository.workspace = true
 
 [dependencies]
 futures-util = { version = "0.3.34", features = ["sink"] }
+hudagents-proto = { version = "0.1.0", path = "../proto" }
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "time"] }
 tokio-tungstenite = "0.30.0"
