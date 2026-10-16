@@ -84,8 +84,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     };
-    timeout(IO_TIMEOUT, ws.close(None))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket close timed out"))??;
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                timeout(IO_TIMEOUT, ws.close(None))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket close timed out"))??;
+                println!("Device stopped");
+                break;
+            }
+            incoming = ws.next() =>  {
+                match incoming {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => {
+                        println!("Server disconnected");
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        return Err(error.into());
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        match ServerMsg::from_json(text.as_str())? {
+                            ServerMsg::Error { code, message } => {
+                                return Err(io::Error::other(format!(
+                                    "Server reported an error ({code:?}): {message}"
+                                ))
+                                .into());
+                            }
+                            ServerMsg::Welcome { .. } => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Received a second welcome",
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unexpected WebSocket message",
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
