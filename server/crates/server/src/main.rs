@@ -25,10 +25,12 @@ use hudagents_proto::{
 use serde::Deserialize;
 use tokio::{
     sync::broadcast::{self, error::RecvError},
-    time::timeout,
+    time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout, timeout_at},
 };
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const PING_INTERVAL: Duration = Duration::from_secs(10);
+const SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct AppState {
@@ -152,7 +154,12 @@ fn accept_hello(message: DeviceMessage) -> std::result::Result<DeviceId, ServerM
 async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
     tracing::info!("Device connected");
     let mut accepted_device: Option<DeviceId> = None;
-    while let Some(message) = socket.recv().await {
+    let now = Instant::now();
+    let mut ping_interval = interval_at(now + PING_INTERVAL, PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let silence = sleep_until(now + SILENCE_TIMEOUT);
+    tokio::pin!(silence);
+    loop {
         // First decide the protocol outcome; sending and state changes happen below.
         let outcome = match message {
             Ok(Message::Text(text)) => {

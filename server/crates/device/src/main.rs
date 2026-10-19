@@ -1,10 +1,16 @@
 use std::{io, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    net::TcpStream,
+    time::{sleep, timeout},
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{Message, protocol::WebSocketConfig},
+    tungstenite::{
+        Error as WsError, Message, error::ProtocolError as WsProtocolError,
+        protocol::WebSocketConfig,
+    },
 };
 
 use hudagents_proto::{
@@ -13,6 +19,8 @@ use hudagents_proto::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 type DeviceSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -29,14 +37,30 @@ enum ConnectionError {
     #[error("Server closed the connection before sending welcome")]
     Closed,
 
-    #[error("Expected a JSON text reply from the server")]
+    #[error("Unexpected message from the server")]
     UnexpectedReply,
 
     #[error("Expected protocol version {PROTOCOL_VERSION}, got {received}")]
     UnsupportedVersion { received: u16 },
 
-    #[error("Device handshake rejected ({code:?}): {message}")]
+    #[error("Server reported an error ({code:?}): {message}")]
     Rejected { code: ErrorCode, message: String },
+}
+
+impl ConnectionError {
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout(_)
+                | Self::Closed
+                | Self::WebSocket(WsError::Io(_))
+                | Self::WebSocket(WsError::ConnectionClosed)
+                | Self::WebSocket(WsError::Protocol(WsProtocolError::HandshakeIncomplete))
+                | Self::WebSocket(WsError::Protocol(
+                    WsProtocolError::ResetWithoutClosingHandshake
+                ))
+        )
+    }
 }
 
 async fn connect_and_handshake(url: &str, hello: &str) -> Result<DeviceSocket, ConnectionError> {
@@ -87,6 +111,29 @@ async fn connect_and_handshake(url: &str, hello: &str) -> Result<DeviceSocket, C
     Ok(ws)
 }
 
+async fn run_session(ws: &mut DeviceSocket) -> Result<(), ConnectionError> {
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | None => {
+                return Ok(());
+            }
+            Some(Err(error)) => {
+                return Err(error.into());
+            }
+            Some(Ok(Message::Text(text))) => match ServerMsg::from_json(text.as_str())? {
+                ServerMsg::Error { code, message } => {
+                    return Err(ConnectionError::Rejected { code, message });
+                }
+                ServerMsg::Welcome { .. } => {
+                    return Err(ConnectionError::UnexpectedReply);
+                }
+            },
+            _ => return Err(ConnectionError::UnexpectedReply),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::args().nth(1).ok_or_else(|| {
@@ -108,56 +155,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let hello = DeviceMessage::hello(device_id).to_json()?;
-    let mut ws = connect_and_handshake(&url, &hello).await?;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut retry_delay = INITIAL_RETRY_DELAY;
     loop {
-        tokio::select! {
+        let connection = tokio::select! {
+            biased;
             result = &mut shutdown => {
                 result?;
-                timeout(IO_TIMEOUT, ws.close(None))
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket close timed out"))??;
                 println!("Device stopped");
-                break;
+                return Ok(());
             }
-            incoming = ws.next() =>  {
-                match incoming {
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => {
-                        println!("Server disconnected");
-                        break;
-                    }
-                    Some(Err(error)) => {
-                        return Err(error.into());
-                    }
-                    Some(Ok(Message::Text(text))) => {
-                        match ServerMsg::from_json(text.as_str())? {
-                            ServerMsg::Error { code, message } => {
-                                return Err(io::Error::other(format!(
-                                    "Server reported an error ({code:?}): {message}"
-                                ))
-                                .into());
-                            }
-                            ServerMsg::Welcome { .. } => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "Received a second welcome",
-                                )
-                                .into());
-                            }
+            result = connect_and_handshake(&url, &hello) => result,
+        };
+        let outcome: Result<(), ConnectionError> = match connection {
+            Err(error) => Err(error),
+            Ok(mut ws) => {
+                retry_delay = INITIAL_RETRY_DELAY;
+                tokio::select! {
+                    biased;
+                    result = &mut shutdown => {
+                        result?;
+                        match timeout(IO_TIMEOUT, ws.close(None)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => eprintln!("WebSocket close failed: {error}"),
+                            Err(_) => eprintln!("WebSocket close timed out"),
                         }
+                        println!("Device stopped");
+                        return Ok(());
                     }
-                    Some(Ok(_)) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Unexpected WebSocket message",
-                        )
-                        .into());
-                    }
+                    result = run_session(&mut ws) => result,
                 }
             }
+        };
+
+        match outcome {
+            Ok(()) => println!("Server disconnected"),
+            Err(error) if error.is_retryable() => eprintln!("Connection failed: {error}"),
+            Err(error) => return Err(error.into()),
         }
+
+        println!("Reconnecting in {} seconds", retry_delay.as_secs());
+        tokio::select! {
+            biased;
+            result = &mut shutdown => {
+                result?;
+                println!("Device stopped");
+                return Ok(());
+            }
+            _ = sleep(retry_delay) => {}
+        }
+        retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
     }
-    Ok(())
 }
