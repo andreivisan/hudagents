@@ -25,7 +25,11 @@ use hudagents_proto::{
 };
 use serde::Deserialize;
 use tokio::{
-    sync::broadcast::{self, error::RecvError},
+    sync::{
+        Mutex,
+        broadcast::{self, error::RecvError},
+        oneshot,
+    },
     time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout, timeout_at},
 };
 
@@ -33,11 +37,87 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug)]
+struct ActiveDevice {
+    connection_id: u64,
+    device_id: DeviceId,
+    stop_tx: oneshot::Sender<()>,
+}
+
 #[derive(Clone)]
 struct AppState {
+    active_device: Arc<Mutex<Option<ActiveDevice>>>,
+    next_connection_id: Arc<AtomicU64>,
     messages: broadcast::Sender<String>,
     phone_token: Arc<str>,
     next_seq: Arc<AtomicU64>,
+}
+
+impl AppState {
+    fn publish_status(&self, body: &str) {
+        let next_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let bridge_status_message = BridgeMessage::status(next_seq, body.to_owned());
+        match serde_json::to_string(&bridge_status_message) {
+            Ok(json_string) => match self.messages.send(json_string) {
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::debug!("Status not broadcast: no display subscribers");
+                }
+            },
+            Err(error) => {
+                tracing::error!(%error, "Failed to serialize status message");
+            }
+        }
+    }
+
+    async fn register_device(&self, device_id: DeviceId, stop_tx: oneshot::Sender<()>) -> u64 {
+        let mut active_device = self.active_device.lock().await;
+        let next_connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let new_active_device = ActiveDevice {
+            connection_id: next_connection_id,
+            device_id,
+            stop_tx,
+        };
+        tracing::info!(
+            connection_id = new_active_device.connection_id,
+            device_id = new_active_device.device_id.as_str(),
+            "Registering device connection"
+        );
+        if let Some(previous) = active_device.replace(new_active_device)
+            && previous.stop_tx.send(()).is_err()
+        {
+            tracing::debug!(
+                connection_id = previous.connection_id,
+                "Previous device handler already stopped"
+            );
+        }
+        // Publish before releasing the lock so ownership and status changes stay ordered.
+        self.publish_status("Camera unit online");
+        drop(active_device);
+        next_connection_id
+    }
+
+    async fn unregister_device(&self, connection_id: u64) {
+        let mut active_device = self.active_device.lock().await;
+        match active_device.as_ref() {
+            Some(present) => {
+                if present.connection_id != connection_id {
+                    return;
+                }
+            }
+            None => {
+                return;
+            }
+        }
+        if let Some(ad) = active_device.take() {
+            tracing::info!(
+                connection_id = ad.connection_id,
+                device_id = ad.device_id.as_str(),
+                "Device connection unregistered"
+            );
+        }
+        self.publish_status("Camera unit offline");
+    }
 }
 
 #[derive(Deserialize)]
@@ -154,7 +234,9 @@ fn accept_hello(message: DeviceMessage) -> std::result::Result<DeviceId, ServerM
 
 async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
     tracing::info!("Device connected");
-    let mut accepted_device: Option<DeviceId> = None;
+    let mut connection_id: Option<u64> = None;
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let mut stop_tx = Some(stop_tx);
     let now = Instant::now();
     let mut ping_interval = interval_at(now + PING_INTERVAL, PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -163,11 +245,24 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
     loop {
         let message = tokio::select! {
             biased;
+            _ = &mut stop_rx => {
+                tracing::info!(?connection_id, "Device connection replaced");
+                match timeout(SEND_TIMEOUT, socket.send(Message::Close(None))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(?connection_id, %error, "Replaced device connection close failed");
+                    }
+                    Err(_) => {
+                        tracing::warn!(?connection_id, "Replaced device connection close timed out");
+                    }
+                }
+                break;
+            }
             _ = &mut silence => {
                 tracing::warn!("Device silence timeout");
                 break;
             }
-            _ = ping_interval.tick(), if accepted_device.is_some() => {
+            _ = ping_interval.tick(), if connection_id.is_some() => {
                 let deadline =
                         silence.deadline().min(Instant::now() + SEND_TIMEOUT);
 
@@ -212,7 +307,7 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                         ErrorCode::InvalidMessage,
                         "Expected a valid device hello".into(),
                     )),
-                    Ok(_) if accepted_device.is_some() => Err(ServerMsg::error(
+                    Ok(_) if connection_id.is_some() => Err(ServerMsg::error(
                         ErrorCode::UnexpectedMessage,
                         "Device has already completed its hello".into(),
                     )),
@@ -231,7 +326,7 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                 ))
             }
             Message::Ping(_) | Message::Pong(_) => {
-                if accepted_device.is_some() {
+                if connection_id.is_some() {
                     silence.as_mut().reset(Instant::now() + SILENCE_TIMEOUT);
                 }
                 continue;
@@ -267,21 +362,18 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
         // Only a successfully sent welcome commits the handshake and announces the device.
         if let Some(id) = device_id {
             tracing::info!(device_id = id.as_str(), "Device hello accepted");
-            accepted_device = Some(id);
+            connection_id = match stop_tx.take() {
+                Some(sender) => Some(state.register_device(id, sender).await),
+                None => {
+                    tracing::error!(
+                        ?connection_id,
+                        "Missing stop sender during device registration"
+                    );
+                    break;
+                }
+            };
             ping_interval.reset_at(Instant::now() + PING_INTERVAL);
             silence.as_mut().reset(Instant::now() + SILENCE_TIMEOUT);
-            let seq = state.next_seq.fetch_add(1, Ordering::Relaxed);
-            let status = BridgeMessage::status(seq, "Camera unit online".into());
-            match serde_json::to_string(&status) {
-                Ok(json) => {
-                    if state.messages.send(json).is_err() {
-                        tracing::debug!("Status not broadcast: no display subscribers");
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, "Failed to serialize status message");
-                }
-            }
         } else {
             match timeout(SEND_TIMEOUT, socket.send(Message::Close(None))).await {
                 Ok(Ok(())) => {}
@@ -295,7 +387,10 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
             break;
         }
     }
-    tracing::info!("Device disconnected");
+    if let Some(id) = connection_id {
+        state.unregister_device(id).await;
+    }
+    tracing::info!(?connection_id, "Device disconnected");
 }
 
 #[tokio::main]
@@ -316,6 +411,8 @@ async fn main() -> Result<()> {
         ));
     }
     let app_state = AppState {
+        active_device: Arc::new(Mutex::new(None)),
+        next_connection_id: Arc::new(AtomicU64::new(1)),
         messages: tx,
         phone_token: phone_token.into(),
         next_seq: Arc::new(AtomicU64::new(1)),
@@ -371,6 +468,8 @@ mod tests {
         let (messages, receiver) = broadcast::channel(64);
         drop(receiver);
         AppState {
+            active_device: Arc::new(Mutex::new(None)),
+            next_connection_id: Arc::new(AtomicU64::new(1)),
             messages,
             phone_token: Arc::from("test-token"),
             next_seq: Arc::new(AtomicU64::new(1)),
