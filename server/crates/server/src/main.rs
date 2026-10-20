@@ -10,6 +10,7 @@ use std::{
 
 use axum::{
     Router,
+    body::Bytes,
     extract::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -160,9 +161,47 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
     let silence = sleep_until(now + SILENCE_TIMEOUT);
     tokio::pin!(silence);
     loop {
+        let message = tokio::select! {
+            biased;
+            _ = &mut silence => {
+                tracing::warn!("Device silence timeout");
+                break;
+            }
+            _ = ping_interval.tick(), if accepted_device.is_some() => {
+                let deadline =
+                        silence.deadline().min(Instant::now() + SEND_TIMEOUT);
+
+                    match timeout_at(
+                        deadline,
+                        socket.send(Message::Ping(Bytes::new())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => continue,
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "Device ping send failed");
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!("Device ping send timed out");
+                            break;
+                        }
+                    }
+            }
+            received = socket.recv() => {
+                match received {
+                    Some(Ok(result)) => result,
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "Device receive failed");
+                        break;
+                    }
+                    None =>  break,
+                }
+            }
+        };
         // First decide the protocol outcome; sending and state changes happen below.
         let outcome = match message {
-            Ok(Message::Text(text)) => {
+            Message::Text(text) => {
                 tracing::info!(
                     message_type = "text",
                     body_bytes = text.len(),
@@ -180,7 +219,7 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                     Ok(message) => accept_hello(message),
                 }
             }
-            Ok(Message::Binary(bytes)) => {
+            Message::Binary(bytes) => {
                 tracing::info!(
                     message_type = "bytes",
                     body_bytes = bytes.len(),
@@ -191,14 +230,13 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                     "Expected a JSON text message; binary messages are not supported".into(),
                 ))
             }
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+            Message::Ping(_) | Message::Pong(_) => {
+                if accepted_device.is_some() {
+                    silence.as_mut().reset(Instant::now() + SILENCE_TIMEOUT);
+                }
                 continue;
             }
-            Ok(Message::Close(_)) => {
-                break;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "Error handling device");
+            Message::Close(_) => {
                 break;
             }
         };
@@ -230,6 +268,8 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
         if let Some(id) = device_id {
             tracing::info!(device_id = id.as_str(), "Device hello accepted");
             accepted_device = Some(id);
+            ping_interval.reset_at(Instant::now() + PING_INTERVAL);
+            silence.as_mut().reset(Instant::now() + SILENCE_TIMEOUT);
             let seq = state.next_seq.fetch_add(1, Ordering::Relaxed);
             let status = BridgeMessage::status(seq, "Camera unit online".into());
             match serde_json::to_string(&status) {

@@ -15,6 +15,7 @@ debug/
 # Editor / IDE
 .cursor/
 .vscode/
+.zed/
 .idea/
 *.iml
 *.swp
