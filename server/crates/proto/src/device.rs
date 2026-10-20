@@ -52,6 +52,20 @@ impl TryFrom<String> for DeviceId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RequestId(u64);
+
+impl RequestId {
+    pub fn new(value: u64) -> Self {
+        RequestId(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceMessage {
@@ -59,13 +73,38 @@ pub enum DeviceMessage {
         protocol_version: u16,
         device_id: DeviceId,
     },
+    CaptureFailed {
+        request_id: RequestId,
+        code: MediaErrorCode,
+        message: String,
+    },
+    RecordFailed {
+        request_id: RequestId,
+        code: MediaErrorCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    Welcome { protocol_version: u16 },
-    Error { code: ErrorCode, message: String },
+    Capture {
+        request_id: RequestId,
+        width: u16,
+        height: u16,
+        quality: u8,
+    },
+    Record {
+        request_id: RequestId,
+        duration_ms: u32,
+    },
+    Welcome {
+        protocol_version: u16,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +113,18 @@ pub enum ErrorCode {
     UnsupportedVersion,
     InvalidMessage,
     UnexpectedMessage,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaErrorCode {
+    InvalidParameters,
+    Busy,
+    Unavailable,
+    Timeout,
+    Io,
     #[serde(other)]
     Unknown,
 }
@@ -145,11 +196,326 @@ fn encode<T: Serialize>(message: &T) -> Result<String, ProtocolError> {
 mod tests {
     use super::{
         DeviceId, DeviceMessage, ErrorCode, InvalidDeviceId, MAX_CONTROL_MESSAGE_BYTES,
-        ProtocolError, ServerMsg,
+        MediaErrorCode, ProtocolError, RequestId, ServerMsg,
     };
 
     const HELLO: &str = r#"{"type":"hello","protocol_version":1,"device_id":"camera-01"}"#;
     const WELCOME: &str = r#"{"type":"welcome","protocol_version":1}"#;
+    const CAPTURE: &str =
+        r#"{"type":"capture","request_id":42,"width":1920,"height":1080,"quality":85}"#;
+    const RECORD: &str = r#"{"type":"record","request_id":42,"duration_ms":30000}"#;
+    const CAPTURE_FAILED: &str = r#"{"type":"capture_failed","request_id":42,"code":"unavailable","message":"Camera unavailable"}"#;
+    const RECORD_FAILED: &str = r#"{"type":"record_failed","request_id":42,"code":"timeout","message":"Recording exceeded its deadline"}"#;
+
+    #[test]
+    fn request_id_is_a_json_integer_and_preserves_the_full_u64_range() {
+        for value in [0, 1, 42, (1_u64 << 53) + 1, u64::MAX] {
+            let id = RequestId::new(value);
+            assert_eq!(id.get(), value);
+            let json = serde_json::to_string(&id).unwrap();
+            assert_eq!(json, value.to_string());
+            assert_eq!(serde_json::from_str::<RequestId>(&json).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn request_id_rejects_non_u64_json_values() {
+        for input in [
+            "-1",
+            "18446744073709551616",
+            "1.5",
+            "1.0",
+            r#""42""#,
+            "null",
+            "true",
+            "[]",
+            "{}",
+        ] {
+            assert!(
+                serde_json::from_str::<RequestId>(input).is_err(),
+                "accepted invalid request id: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_and_record_match_wire_format_and_round_trip() {
+        let examples = [
+            (
+                ServerMsg::Capture {
+                    request_id: RequestId::new(42),
+                    width: 1920,
+                    height: 1080,
+                    quality: 85,
+                },
+                CAPTURE,
+            ),
+            (
+                ServerMsg::Record {
+                    request_id: RequestId::new(42),
+                    duration_ms: 30_000,
+                },
+                RECORD,
+            ),
+        ];
+        for (message, expected) in examples {
+            let json = message.to_json().unwrap();
+            // Compare JSON structure: object field ordering is not part of the contract.
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+                serde_json::from_str::<serde_json::Value>(expected).unwrap()
+            );
+            assert_eq!(ServerMsg::from_json(expected).unwrap(), message);
+            assert_eq!(ServerMsg::from_json(&json).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn media_failures_match_wire_format_and_round_trip() {
+        let examples = [
+            (
+                DeviceMessage::CaptureFailed {
+                    request_id: RequestId::new(42),
+                    code: MediaErrorCode::Unavailable,
+                    message: "Camera unavailable".into(),
+                },
+                CAPTURE_FAILED,
+            ),
+            (
+                DeviceMessage::RecordFailed {
+                    request_id: RequestId::new(42),
+                    code: MediaErrorCode::Timeout,
+                    message: "Recording exceeded its deadline".into(),
+                },
+                RECORD_FAILED,
+            ),
+        ];
+        for (message, expected) in examples {
+            let json = message.to_json().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+                serde_json::from_str::<serde_json::Value>(expected).unwrap()
+            );
+            assert_eq!(DeviceMessage::from_json(expected).unwrap(), message);
+            assert_eq!(DeviceMessage::from_json(&json).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn media_error_codes_have_stable_snake_case_names() {
+        for (code, wire) in [
+            (MediaErrorCode::InvalidParameters, "invalid_parameters"),
+            (MediaErrorCode::Busy, "busy"),
+            (MediaErrorCode::Unavailable, "unavailable"),
+            (MediaErrorCode::Timeout, "timeout"),
+            (MediaErrorCode::Io, "io"),
+            (MediaErrorCode::Unknown, "unknown"),
+        ] {
+            let json = format!("\"{wire}\"");
+            assert_eq!(serde_json::to_string(&code).unwrap(), json);
+            assert_eq!(serde_json::from_str::<MediaErrorCode>(&json).unwrap(), code);
+        }
+    }
+
+    #[test]
+    fn unknown_media_error_codes_preserve_failure_and_message() {
+        let message = "Microphone \"busy\"\nTry again — later.";
+        for kind in ["capture_failed", "record_failed"] {
+            let json = serde_json::json!({
+                "type": kind,
+                "request_id": 42,
+                "code": "new_firmware_error",
+                "message": message,
+            })
+            .to_string();
+            let expected = if kind == "capture_failed" {
+                DeviceMessage::CaptureFailed {
+                    request_id: RequestId::new(42),
+                    code: MediaErrorCode::Unknown,
+                    message: message.into(),
+                }
+            } else {
+                DeviceMessage::RecordFailed {
+                    request_id: RequestId::new(42),
+                    code: MediaErrorCode::Unknown,
+                    message: message.into(),
+                }
+            };
+            let decoded = DeviceMessage::from_json(&json).unwrap();
+            assert_eq!(decoded, expected);
+            assert_eq!(
+                DeviceMessage::from_json(&decoded.to_json().unwrap()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn media_messages_reject_the_wrong_direction() {
+        for input in [CAPTURE, RECORD] {
+            assert!(DeviceMessage::from_json(input).is_err());
+        }
+        for input in [CAPTURE_FAILED, RECORD_FAILED] {
+            assert!(ServerMsg::from_json(input).is_err());
+        }
+    }
+
+    #[test]
+    fn media_commands_reject_missing_and_null_fields() {
+        for input in [CAPTURE, RECORD] {
+            let original: serde_json::Value = serde_json::from_str(input).unwrap();
+            for field in original.as_object().unwrap().keys() {
+                let mut missing = original.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    matches!(
+                        ServerMsg::from_json(&missing.to_string()),
+                        Err(ProtocolError::Invalid(_))
+                    ),
+                    "accepted missing {field}: {missing}"
+                );
+                let mut null = original.clone();
+                null[field] = serde_json::Value::Null;
+                assert!(
+                    matches!(
+                        ServerMsg::from_json(&null.to_string()),
+                        Err(ProtocolError::Invalid(_))
+                    ),
+                    "accepted null {field}: {null}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn media_commands_reject_wrong_types_and_integer_overflow() {
+        use serde_json::json;
+
+        for (input, field, value) in [
+            (CAPTURE, "request_id", json!("42")),
+            (CAPTURE, "request_id", json!(-1)),
+            (CAPTURE, "width", json!("1920")),
+            (CAPTURE, "width", json!(-1)),
+            (CAPTURE, "width", json!(65_536)),
+            (CAPTURE, "height", json!(1080.5)),
+            (CAPTURE, "height", json!(65_536)),
+            (CAPTURE, "quality", json!("85")),
+            (CAPTURE, "quality", json!(-1)),
+            (CAPTURE, "quality", json!(256)),
+            (RECORD, "request_id", json!(42.5)),
+            (RECORD, "duration_ms", json!("30000")),
+            (RECORD, "duration_ms", json!(-1)),
+            (RECORD, "duration_ms", json!(30_000.5)),
+            (RECORD, "duration_ms", json!(u64::from(u32::MAX) + 1)),
+        ] {
+            let mut message: serde_json::Value = serde_json::from_str(input).unwrap();
+            message[field] = value;
+            assert!(
+                matches!(
+                    ServerMsg::from_json(&message.to_string()),
+                    Err(ProtocolError::Invalid(_))
+                ),
+                "accepted invalid command: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_failures_reject_missing_null_and_mistyped_fields() {
+        for input in [CAPTURE_FAILED, RECORD_FAILED] {
+            let original: serde_json::Value = serde_json::from_str(input).unwrap();
+            for field in original.as_object().unwrap().keys() {
+                let mut missing = original.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    matches!(
+                        DeviceMessage::from_json(&missing.to_string()),
+                        Err(ProtocolError::Invalid(_))
+                    ),
+                    "accepted missing {field}: {missing}"
+                );
+                for invalid in [serde_json::Value::Null, serde_json::json!(true)] {
+                    let mut message = original.clone();
+                    message[field] = invalid;
+                    assert!(
+                        matches!(
+                            DeviceMessage::from_json(&message.to_string()),
+                            Err(ProtocolError::Invalid(_))
+                        ),
+                        "accepted invalid {field}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_messages_accept_additional_fields() {
+        for input in [CAPTURE, RECORD, CAPTURE_FAILED, RECORD_FAILED] {
+            let mut message: serde_json::Value = serde_json::from_str(input).unwrap();
+            message["future_option"] = serde_json::json!({"enabled": true});
+            let extended = message.to_string();
+            if matches!(input, CAPTURE | RECORD) {
+                assert_eq!(
+                    ServerMsg::from_json(&extended).unwrap(),
+                    ServerMsg::from_json(input).unwrap()
+                );
+            } else {
+                assert_eq!(
+                    DeviceMessage::from_json(&extended).unwrap(),
+                    DeviceMessage::from_json(input).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn media_commands_keep_the_four_kib_control_limit() {
+        for input in [CAPTURE, RECORD] {
+            let mut at_limit = format!(
+                "{input}{}",
+                " ".repeat(MAX_CONTROL_MESSAGE_BYTES - input.len())
+            );
+            assert_eq!(
+                ServerMsg::from_json(&at_limit).unwrap(),
+                ServerMsg::from_json(input).unwrap()
+            );
+            at_limit.push(' ');
+            assert!(matches!(
+                ServerMsg::from_json(&at_limit),
+                Err(ProtocolError::TooLarge { len }) if len == MAX_CONTROL_MESSAGE_BYTES + 1
+            ));
+        }
+    }
+
+    #[test]
+    fn media_failure_encoding_and_decoding_enforce_the_control_limit() {
+        for input in [CAPTURE_FAILED, RECORD_FAILED] {
+            let mut value: serde_json::Value = serde_json::from_str(input).unwrap();
+            value["message"] = serde_json::json!("");
+            let overhead = value.to_string().len();
+            value["message"] = serde_json::json!("a".repeat(MAX_CONTROL_MESSAGE_BYTES - overhead));
+            let json = value.to_string();
+            assert_eq!(json.len(), MAX_CONTROL_MESSAGE_BYTES);
+            let message = DeviceMessage::from_json(&json).unwrap();
+            assert_eq!(message.to_json().unwrap().len(), MAX_CONTROL_MESSAGE_BYTES);
+
+            match value.get_mut("message").unwrap() {
+                serde_json::Value::String(text) => text.push('a'),
+                _ => unreachable!("test message must be a string"),
+            }
+            let oversized_json = value.to_string();
+            let oversized_message: DeviceMessage = serde_json::from_str(&oversized_json).unwrap();
+            assert!(matches!(
+                oversized_message.to_json(),
+                Err(ProtocolError::TooLarge { len }) if len == MAX_CONTROL_MESSAGE_BYTES + 1
+            ));
+            assert!(matches!(
+                DeviceMessage::from_json(&oversized_json),
+                Err(ProtocolError::TooLarge { len }) if len == MAX_CONTROL_MESSAGE_BYTES + 1
+            ));
+        }
+    }
 
     #[test]
     fn hello_matches_wire_format_and_round_trips() {

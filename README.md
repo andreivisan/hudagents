@@ -134,3 +134,14 @@ Contributions are not yet opened.
 ## License
 
 Licensed under `MIT OR Apache-2.0`.
+
+TODO
+----
+
+| Date | Required milestone |
+|---|---|
+| 19–20 Oct | Finish connection reliability and media protocol; verify camera, microphone, taps, and local model availability |
+| 21–24 Oct | Both modes produce a real local answer in HudBridge and on the glasses |
+| 26–29 Oct | Error recovery, boot service, 10 + 10 successful runs, demo network, fallback video |
+| 30–31 Oct | Cold-start rehearsals and freeze |
+| 2 Nov | Final rehearsals and packing |
