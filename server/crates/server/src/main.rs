@@ -20,7 +20,7 @@ use axum::{
     routing::{get, post},
 };
 use hudagents_proto::{
-    BridgeMessage, MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION,
+    BridgeMessage, BridgeTelemetry, MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION,
     device::{DeviceId, DeviceMessage, ErrorCode, ServerMsg},
 };
 use serde::Deserialize;
@@ -68,6 +68,34 @@ impl AppState {
                 tracing::error!(%error, "Failed to serialize status message");
             }
         }
+    }
+
+    // Returns whether this reading belongs to the current connection, regardless of delivery.
+    async fn publish_telemetry(&self, connection_id: u64, temp_millicelsius: i32) -> bool {
+        let active_device = self.active_device.lock().await;
+        match active_device.as_ref() {
+            Some(ad) if ad.connection_id == connection_id => {}
+            _ => return false,
+        }
+
+        let temp_c = f64::from(temp_millicelsius) / 1000.0;
+        let next_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let telemetry_message = BridgeTelemetry::new(next_seq, temp_c);
+        match serde_json::to_string(&telemetry_message) {
+            Ok(json_string) => match self.messages.send(json_string) {
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::debug!("Telemetry not broadcast: no display subscribers");
+                }
+            },
+            Err(error) => {
+                tracing::error!(connection_id, %error, "Failed to serialize telemetry message");
+            }
+        }
+
+        // Keep ownership stable until this reading has been published.
+        drop(active_device);
+        true
     }
 
     async fn register_device(&self, device_id: DeviceId, stop_tx: oneshot::Sender<()>) -> u64 {
@@ -229,6 +257,16 @@ fn accept_hello(message: DeviceMessage) -> std::result::Result<DeviceId, ServerM
                 ))
             }
         }
+        DeviceMessage::CaptureFailed { .. } | DeviceMessage::RecordFailed { .. } => {
+            Err(ServerMsg::error(
+                ErrorCode::UnexpectedMessage,
+                "Expected hello before media message".to_string(),
+            ))
+        }
+        DeviceMessage::Telemetry { .. } => Err(ServerMsg::error(
+            ErrorCode::UnexpectedMessage,
+            "Expected hello before telemetry".to_owned(),
+        )),
     }
 }
 
@@ -297,21 +335,42 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
         // First decide the protocol outcome; sending and state changes happen below.
         let outcome = match message {
             Message::Text(text) => {
-                tracing::info!(
+                tracing::debug!(
                     message_type = "text",
                     body_bytes = text.len(),
                     "Device message received"
                 );
-                match DeviceMessage::from_json(text.as_str()) {
-                    Err(_) => Err(ServerMsg::error(
+                match (connection_id, DeviceMessage::from_json(text.as_str())) {
+                    (_, Err(_)) => Err(ServerMsg::error(
                         ErrorCode::InvalidMessage,
-                        "Expected a valid device hello".into(),
+                        "Invalid device control message".into(),
                     )),
-                    Ok(_) if connection_id.is_some() => Err(ServerMsg::error(
+                    (None, Ok(message)) => accept_hello(message),
+                    (Some(current_id), Ok(DeviceMessage::Telemetry { temp_millicelsius })) => {
+                        match temp_millicelsius {
+                            -40_000..=150_000 => {
+                                if state.publish_telemetry(current_id, temp_millicelsius).await {
+                                    silence.as_mut().reset(Instant::now() + SILENCE_TIMEOUT);
+                                }
+                                continue;
+                            }
+                            _ => Err(ServerMsg::error(
+                                ErrorCode::InvalidMessage,
+                                format!(
+                                    "Temperature must be between -40000 and 150000 millidegrees Celsius; received {temp_millicelsius}"
+                                ),
+                            )),
+                        }
+                    }
+                    (Some(_), Ok(DeviceMessage::Hello { .. })) => Err(ServerMsg::error(
                         ErrorCode::UnexpectedMessage,
-                        "Device has already completed its hello".into(),
+                        "Device has already completed its hello".to_string(),
                     )),
-                    Ok(message) => accept_hello(message),
+                    (Some(_), Ok(DeviceMessage::CaptureFailed { .. }))
+                    | (Some(_), Ok(DeviceMessage::RecordFailed { .. })) => Err(ServerMsg::error(
+                        ErrorCode::UnexpectedMessage,
+                        "Received a media failure without a pending request".to_string(),
+                    )),
                 }
             }
             Message::Binary(bytes) => {

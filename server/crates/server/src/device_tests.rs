@@ -399,6 +399,10 @@ async fn invalid_hello_cannot_replace_an_existing_owner() {
             r#"{"type":"hello","protocol_version":2,"device_id":"camera-01"}"#,
             ErrorCode::UnsupportedVersion,
         ),
+        (
+            r#"{"type":"telemetry","temp_millicelsius":53250}"#,
+            ErrorCode::UnexpectedMessage,
+        ),
     ] {
         let mut newcomer = server.connect().await;
         send(&mut newcomer, ClientMessage::Text(hello.into())).await;
@@ -559,4 +563,294 @@ async fn oversized_hello_is_rejected_at_websocket_layer() {
         statuses.try_recv(),
         Err(broadcast::error::TryRecvError::Empty)
     ));
+}
+
+async fn send_telemetry(client: &mut Client, temperature: i32) {
+    let json = format!(r#"{{"type":"telemetry","temp_millicelsius":{temperature}}}"#);
+    send(client, ClientMessage::Text(json.into())).await;
+}
+
+async fn expect_telemetry(
+    receiver: &mut broadcast::Receiver<String>,
+    seq: u64,
+    temp_c: f64,
+) -> String {
+    let json = timeout(TEST_TIMEOUT, receiver.recv())
+        .await
+        .expect("telemetry broadcast timed out")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["type"], "telemetry");
+    assert_eq!(value["seq"], seq);
+    assert!((value["temp_c"].as_f64().unwrap() - temp_c).abs() < 1e-9);
+    assert_eq!(value.as_object().unwrap().len(), 4);
+    let id = value["id"].as_str().unwrap();
+    assert!(!id.is_empty());
+    id.to_owned()
+}
+
+#[tokio::test]
+async fn telemetry_without_an_owner_is_ignored_without_consuming_a_sequence() {
+    let (state, mut messages) = state_with_subscriber();
+    assert!(!state.publish_telemetry(1, 53_250).await);
+    assert_eq!(state.next_seq.load(Ordering::Relaxed), 1);
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn telemetry_from_a_replaced_or_unregistered_owner_is_ignored() {
+    let (state, mut messages) = state_with_subscriber();
+    let (first_tx, first_rx) = oneshot::channel();
+    let first = state.register_device(camera_id(), first_tx).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    let (second_tx, _second_rx) = oneshot::channel();
+    let second = state.register_device(camera_id(), second_tx).await;
+    expect_status(&mut messages, "Camera unit online", 2).await;
+    timeout(TEST_TIMEOUT, first_rx).await.unwrap().unwrap();
+
+    assert!(!state.publish_telemetry(first, 53_250).await);
+    assert_eq!(state.next_seq.load(Ordering::Relaxed), 3);
+    assert_no_statuses(&mut messages);
+    assert!(state.publish_telemetry(second, 42_500).await);
+    expect_telemetry(&mut messages, 3, 42.5).await;
+
+    state.unregister_device(second).await;
+    expect_status(&mut messages, "Camera unit offline", 4).await;
+    assert!(!state.publish_telemetry(second, 53_250).await);
+    assert_eq!(state.next_seq.load(Ordering::Relaxed), 5);
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn telemetry_shares_sequence_numbers_with_text_and_status_and_uses_fresh_ids() {
+    let (state, mut messages) = state_with_subscriber();
+    let (stop_tx, _stop_rx) = oneshot::channel();
+    let connection = state.register_device(camera_id(), stop_tx).await;
+    let online = expect_status(&mut messages, "Camera unit online", 1).await;
+
+    assert!(state.publish_telemetry(connection, 53_250).await);
+    let first_id = expect_telemetry(&mut messages, 2, 53.25).await;
+    assert_ne!(first_id, online.id.to_string());
+    state.publish_status("Thinking…");
+    let thinking = expect_status(&mut messages, "Thinking…", 3).await;
+    assert_ne!(first_id, thinking.id.to_string());
+
+    assert_eq!(
+        say(State(state.clone()), "hello".into()).await,
+        StatusCode::NO_CONTENT
+    );
+    let text = receive_status(&mut messages).await;
+    assert_eq!(text.msg_type, MessageType::Text);
+    assert_eq!(text.body, "hello");
+    assert_eq!(text.seq, 4);
+    assert!(state.publish_telemetry(connection, 53_250).await);
+    let second_id = expect_telemetry(&mut messages, 5, 53.25).await;
+    assert_ne!(first_id, second_id);
+    assert_ne!(second_id, text.id.to_string());
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn telemetry_is_accepted_without_subscribers_and_new_subscribers_get_fresh_readings() {
+    let (state, messages) = state_with_subscriber();
+    drop(messages);
+    let (stop_tx, _stop_rx) = oneshot::channel();
+    let connection = state.register_device(camera_id(), stop_tx).await;
+    assert!(state.publish_telemetry(connection, 53_250).await);
+
+    let mut messages = state.messages.subscribe();
+    assert_no_statuses(&mut messages);
+    assert!(state.publish_telemetry(connection, 53_250).await);
+    expect_telemetry(&mut messages, 3, 53.25).await;
+    assert_eq!(active_connection_id(&state).await, Some(connection));
+}
+
+#[tokio::test]
+async fn telemetry_before_hello_is_rejected_without_acquiring_ownership() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut client = server.connect().await;
+    send_telemetry(&mut client, 53_250).await;
+    assert_eq!(
+        receive_reply(&mut client).await,
+        ServerMsg::error(
+            ErrorCode::UnexpectedMessage,
+            "Expected hello before telemetry".into()
+        )
+    );
+    assert!(matches!(
+        receive(&mut client).await,
+        ClientMessage::Close(_)
+    ));
+    assert_eq!(active_connection_id(&server.state).await, None);
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn telemetry_after_hello_accepts_bounds_and_never_sends_another_welcome() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut client = server.connect().await;
+    send_hello(&mut client).await;
+    let online = expect_status(&mut messages, "Camera unit online", 1).await;
+    let owner = active_connection_id(&server.state).await;
+    let mut previous_id = online.id.to_string();
+    let readings = [
+        (-40_000, -40.0),
+        (-1, -0.001),
+        (0, 0.0),
+        (53_250, 53.25),
+        (53_250, 53.25),
+        (150_000, 150.0),
+    ];
+    for (index, (raw, celsius)) in readings.into_iter().enumerate() {
+        send_telemetry(&mut client, raw).await;
+        let id = expect_telemetry(&mut messages, index as u64 + 2, celsius).await;
+        assert_ne!(id, previous_id);
+        previous_id = id;
+        assert_eq!(active_connection_id(&server.state).await, owner);
+    }
+
+    // A ping is a barrier: an accidental welcome/error would arrive before its pong.
+    send(&mut client, ClientMessage::Ping(vec![7].into())).await;
+    assert_eq!(
+        receive(&mut client).await,
+        ClientMessage::Pong(vec![7].into())
+    );
+    assert_no_statuses(&mut messages);
+    send(&mut client, ClientMessage::Close(None)).await;
+    expect_status(&mut messages, "Camera unit offline", 8).await;
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn out_of_range_telemetry_sends_an_error_and_closes_without_broadcasting_the_reading() {
+    // -40001 specifically catches the accidental -400000 lower bound.
+    for raw in [-40_001, 150_001, i32::MIN, i32::MAX] {
+        let (server, mut messages) = TestServer::start().await;
+        let mut client = server.connect().await;
+        send_hello(&mut client).await;
+        expect_status(&mut messages, "Camera unit online", 1).await;
+        send_telemetry(&mut client, raw).await;
+        assert_eq!(
+            receive_reply(&mut client).await,
+            ServerMsg::error(
+                ErrorCode::InvalidMessage,
+                format!(
+                    "Temperature must be between -40000 and 150000 millidegrees Celsius; received {raw}"
+                )
+            )
+        );
+        assert!(matches!(
+            receive(&mut client).await,
+            ClientMessage::Close(_)
+        ));
+        expect_status(&mut messages, "Camera unit offline", 2).await;
+        assert_eq!(active_connection_id(&server.state).await, None);
+        assert_no_statuses(&mut messages);
+    }
+}
+
+#[tokio::test]
+async fn malformed_telemetry_after_hello_is_rejected() {
+    for input in [
+        r#"{"type":"telemetry"}"#,
+        r#"{"type":"telemetry","temp_millicelsius":null}"#,
+        r#"{"type":"telemetry","temp_millicelsius":"53250"}"#,
+        r#"{"type":"telemetry","temp_millicelsius":53.25}"#,
+        r#"{"type":"telemetry","temp_millicelsius":2147483648}"#,
+    ] {
+        let (server, mut messages) = TestServer::start().await;
+        let mut client = server.connect().await;
+        send_hello(&mut client).await;
+        expect_status(&mut messages, "Camera unit online", 1).await;
+        send(&mut client, ClientMessage::Text(input.into())).await;
+        assert_eq!(
+            receive_reply(&mut client).await,
+            ServerMsg::error(
+                ErrorCode::InvalidMessage,
+                "Invalid device control message".into()
+            )
+        );
+        assert!(matches!(
+            receive(&mut client).await,
+            ClientMessage::Close(_)
+        ));
+        expect_status(&mut messages, "Camera unit offline", 2).await;
+        assert_eq!(active_connection_id(&server.state).await, None);
+        assert_no_statuses(&mut messages);
+    }
+}
+
+#[tokio::test]
+async fn replacement_publishes_only_the_new_owners_telemetry() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut first = server.connect().await;
+    send_hello(&mut first).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    send_telemetry(&mut first, 42_000).await;
+    expect_telemetry(&mut messages, 2, 42.0).await;
+    let first_id = active_connection_id(&server.state).await.unwrap();
+
+    let mut second = server.connect().await;
+    send_hello(&mut second).await;
+    expect_status(&mut messages, "Camera unit online", 3).await;
+    assert!(matches!(receive(&mut first).await, ClientMessage::Close(_)));
+    // Simulate a late reading from the replaced handler, after ownership changed.
+    assert!(!server.state.publish_telemetry(first_id, 99_000).await);
+    send_telemetry(&mut second, 53_250).await;
+    expect_telemetry(&mut messages, 4, 53.25).await;
+    assert_no_statuses(&mut messages);
+    send(&mut second, ClientMessage::Close(None)).await;
+    expect_status(&mut messages, "Camera unit offline", 5).await;
+    assert_no_statuses(&mut messages);
+}
+
+// Never poll the client after hello: automatic pongs must not mask a broken
+// telemetry silence reset. Exercise both presence and absence of subscribers.
+async fn check_telemetry_keeps_device_online(has_subscriber: bool) {
+    let (server, messages) = TestServer::start().await;
+    let mut messages = Some(messages);
+    let mut client = server.connect().await;
+    send_hello(&mut client).await;
+    expect_status(messages.as_mut().unwrap(), "Camera unit online", 1).await;
+    let owner = active_connection_id(&server.state).await;
+    if !has_subscriber {
+        drop(messages.take());
+    }
+
+    // Seven readings at five-second intervals cross the initial 30 s deadline.
+    for index in 0..7 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        send_telemetry(&mut client, 53_250).await;
+        if let Some(receiver) = messages.as_mut() {
+            expect_telemetry(receiver, index + 2, 53.25).await;
+        } else {
+            timeout(TEST_TIMEOUT, async {
+                while server.state.next_seq.load(Ordering::Relaxed) != index + 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("server did not process telemetry without subscribers");
+        }
+    }
+    // Subscribe after the quiet period too: verify that the server actually
+    // processes the next frame, rather than merely leaving stale ownership set.
+    if messages.is_none() {
+        messages = Some(server.state.messages.subscribe());
+    }
+    send_telemetry(&mut client, 53_250).await;
+    expect_telemetry(messages.as_mut().unwrap(), 9, 53.25).await;
+    assert_eq!(active_connection_id(&server.state).await, owner);
+    drop(client);
+    expect_status(messages.as_mut().unwrap(), "Camera unit offline", 10).await;
+    assert_no_statuses(messages.as_mut().unwrap());
+}
+
+#[tokio::test]
+#[ignore = "real-time telemetry heartbeat check: about 35 seconds"]
+async fn telemetry_resets_silence_with_and_without_display_subscribers() {
+    tokio::join!(
+        check_telemetry_keeps_device_online(true),
+        check_telemetry_keeps_device_online(false),
+    );
 }

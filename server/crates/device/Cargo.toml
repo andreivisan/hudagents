@@ -9,5 +9,5 @@ repository.workspace = true
 futures-util = { version = "0.3.34", features = ["sink"] }
 hudagents-proto = { version = "0.1.0", path = "../proto" }
 thiserror = "2"
-tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
+tokio = { version = "1.53.3", features = ["fs", "macros", "rt-multi-thread", "net", "time", "signal"] }
 tokio-tungstenite = "0.30.0"

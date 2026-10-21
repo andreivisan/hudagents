@@ -83,6 +83,9 @@ pub enum DeviceMessage {
         code: MediaErrorCode,
         message: String,
     },
+    Telemetry {
+        temp_millicelsius: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +209,85 @@ mod tests {
     const RECORD: &str = r#"{"type":"record","request_id":42,"duration_ms":30000}"#;
     const CAPTURE_FAILED: &str = r#"{"type":"capture_failed","request_id":42,"code":"unavailable","message":"Camera unavailable"}"#;
     const RECORD_FAILED: &str = r#"{"type":"record_failed","request_id":42,"code":"timeout","message":"Recording exceeded its deadline"}"#;
+
+    #[test]
+    fn telemetry_matches_wire_format_and_round_trips() {
+        let json = r#"{"type":"telemetry","temp_millicelsius":53250}"#;
+        let message = DeviceMessage::Telemetry {
+            temp_millicelsius: 53_250,
+        };
+        assert_eq!(message.to_json().unwrap(), json);
+        assert_eq!(DeviceMessage::from_json(json).unwrap(), message);
+        assert!(ServerMsg::from_json(json).is_err());
+    }
+
+    #[test]
+    fn telemetry_preserves_signed_integers_for_handler_validation() {
+        // Plausible temperature limits belong to the reader and server handler;
+        // the wire type itself represents every i32 value without rounding.
+        for value in [
+            i32::MIN,
+            -40_001,
+            -40_000,
+            -1,
+            0,
+            150_000,
+            150_001,
+            i32::MAX,
+        ] {
+            let message = DeviceMessage::Telemetry {
+                temp_millicelsius: value,
+            };
+            assert_eq!(
+                DeviceMessage::from_json(&message.to_json().unwrap()).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_rejects_missing_mistyped_and_overflowing_temperature() {
+        assert!(DeviceMessage::from_json(r#"{"type":"telemetry"}"#).is_err());
+        for value in [
+            "null",
+            "true",
+            r#""53250""#,
+            "53.25",
+            "53250.0",
+            "[]",
+            "{}",
+            "2147483648",
+            "-2147483649",
+        ] {
+            let json = format!(r#"{{"type":"telemetry","temp_millicelsius":{value}}}"#);
+            assert!(DeviceMessage::from_json(&json).is_err(), "accepted {json}");
+        }
+    }
+
+    #[test]
+    fn telemetry_ignores_extra_fields() {
+        let json = r#"{"type":"telemetry","temp_millicelsius":53250,"firmware":"0.2"}"#;
+        assert_eq!(
+            DeviceMessage::from_json(json).unwrap(),
+            DeviceMessage::Telemetry {
+                temp_millicelsius: 53_250,
+            }
+        );
+    }
+
+    #[test]
+    fn telemetry_obeys_the_control_message_size_limit() {
+        let json = r#"{"type":"telemetry","temp_millicelsius":53250}"#;
+        let at_limit = format!(
+            "{json}{}",
+            " ".repeat(MAX_CONTROL_MESSAGE_BYTES - json.len())
+        );
+        assert!(DeviceMessage::from_json(&at_limit).is_ok());
+        let oversized = format!("{at_limit} ");
+        assert!(matches!(DeviceMessage::from_json(&oversized),
+            Err(ProtocolError::TooLarge { len }) if len == MAX_CONTROL_MESSAGE_BYTES + 1
+        ));
+    }
 
     #[test]
     fn request_id_is_a_json_integer_and_preserves_the_full_u64_range() {

@@ -43,9 +43,56 @@ impl BridgeMessage {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename = "telemetry")]
+pub struct BridgeTelemetry {
+    seq: u64,
+    id: Uuid,
+    temp_c: f64,
+}
+
+impl BridgeTelemetry {
+    pub fn new(seq: u64, temp_c: f64) -> Self {
+        BridgeTelemetry {
+            seq,
+            id: Uuid::new_v4(),
+            temp_c,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_serializes_the_bridge_contract_without_a_body() {
+        let message = BridgeTelemetry::new(42, 53.25);
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "telemetry",
+                "seq": 42,
+                "id": message.id.to_string(),
+                "temp_c": 53.25,
+            })
+        );
+        assert_eq!(
+            Uuid::parse_str(json["id"].as_str().unwrap()).unwrap(),
+            message.id
+        );
+        assert_eq!(message.id.get_version_num(), 4);
+    }
+
+    #[test]
+    fn telemetry_gives_repeated_readings_fresh_ids() {
+        let first = BridgeTelemetry::new(1, 53.25);
+        let second = BridgeTelemetry::new(2, 53.25);
+        assert_ne!(first.id, second.id);
+        assert!(!first.id.is_nil());
+        assert!(!second.id.is_nil());
+    }
 
     #[test]
     fn test_serialize_message() {

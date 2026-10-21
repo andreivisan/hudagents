@@ -3,7 +3,7 @@ use std::{io, time::Duration};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     net::TcpStream,
-    time::{sleep, timeout},
+    time::{self, sleep, timeout},
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
@@ -17,6 +17,8 @@ use hudagents_proto::{
     MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION,
     device::{DeviceId, DeviceMessage, ErrorCode, ServerMsg},
 };
+
+mod temperature;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -107,29 +109,69 @@ async fn connect_and_handshake(url: &str, hello: &str) -> Result<DeviceSocket, C
         ServerMsg::Error { code, message } => {
             return Err(ConnectionError::Rejected { code, message });
         }
+        ServerMsg::Capture { .. } | ServerMsg::Record { .. } => {
+            return Err(ConnectionError::UnexpectedReply);
+        }
     };
     Ok(ws)
 }
 
 async fn run_session(ws: &mut DeviceSocket) -> Result<(), ConnectionError> {
+    let mut interval = time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut temperature_read_failed = false;
     loop {
-        match ws.next().await {
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-            Some(Ok(Message::Close(_))) | None => {
-                return Ok(());
-            }
-            Some(Err(error)) => {
-                return Err(error.into());
-            }
-            Some(Ok(Message::Text(text))) => match ServerMsg::from_json(text.as_str())? {
-                ServerMsg::Error { code, message } => {
-                    return Err(ConnectionError::Rejected { code, message });
+        tokio::select! {
+            received = ws.next() => {
+                match received {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Ok(());
+                    }
+                    Some(Err(error)) => {
+                        return Err(error.into());
+                    }
+                    Some(Ok(Message::Text(text))) => match ServerMsg::from_json(text.as_str())? {
+                        ServerMsg::Error { code, message } => {
+                            return Err(ConnectionError::Rejected { code, message });
+                        }
+                        ServerMsg::Welcome { .. } => {
+                            return Err(ConnectionError::UnexpectedReply);
+                        }
+                        ServerMsg::Capture { .. } | ServerMsg::Record { .. } => {
+                            return Err(ConnectionError::UnexpectedReply);
+                        }
+                    },
+                    _ => return Err(ConnectionError::UnexpectedReply),
                 }
-                ServerMsg::Welcome { .. } => {
-                    return Err(ConnectionError::UnexpectedReply);
+            }
+            _ = interval.tick() => {
+                match temperature::read_temperature().await {
+                    Ok(temperature) => {
+                        if temperature_read_failed {
+                            println!("Temperature reading resumed");
+                            temperature_read_failed = false;
+                        }
+                        let json = DeviceMessage::Telemetry {
+                            temp_millicelsius: temperature,
+                        }
+                        .to_json()?;
+
+                        timeout(
+                            IO_TIMEOUT,
+                            ws.send(Message::Text(json.into())),
+                        )
+                        .await
+                        .map_err(|_| ConnectionError::Timeout("sending temperature telemetry"))??;
+                    }
+                    Err(error) => {
+                        if !temperature_read_failed {
+                            println!("Temperature reading unavailable: {error}");
+                            temperature_read_failed = true;
+                        }
+                    }
                 }
-            },
-            _ => return Err(ConnectionError::UnexpectedReply),
+            }
         }
     }
 }
