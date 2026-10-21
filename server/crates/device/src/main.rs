@@ -18,6 +18,7 @@ use hudagents_proto::{
     device::{DeviceId, DeviceMessage, ErrorCode, ServerMsg},
 };
 
+mod capture;
 mod temperature;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
