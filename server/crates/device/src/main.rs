@@ -1,6 +1,6 @@
 use std::{io, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use tokio::{
     net::TcpStream,
     time::{self, sleep, timeout},
@@ -15,7 +15,8 @@ use tokio_tungstenite::{
 
 use hudagents_proto::{
     MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION,
-    device::{DeviceId, DeviceMessage, ErrorCode, ServerMsg},
+    device::{DeviceId, DeviceMessage, ErrorCode, MediaErrorCode, ServerMsg},
+    media::{MediaFrame, MediaKind},
 };
 
 mod capture;
@@ -117,10 +118,23 @@ async fn connect_and_handshake(url: &str, hello: &str) -> Result<DeviceSocket, C
     Ok(ws)
 }
 
+async fn send_device_message(
+    ws: &mut DeviceSocket,
+    message: DeviceMessage,
+) -> Result<(), ConnectionError> {
+    let device_message = DeviceMessage::to_json(&message)?;
+    timeout(IO_TIMEOUT, ws.send(Message::Text(device_message.into())))
+        .await
+        .map_err(|_| ConnectionError::Timeout("sending device control message"))??;
+    Ok(())
+}
+
 async fn run_session(ws: &mut DeviceSocket) -> Result<(), ConnectionError> {
     let mut interval = time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut temperature_read_failed = false;
+    let mut captures = FuturesUnordered::new();
+
     loop {
         tokio::select! {
             received = ws.next() => {
@@ -139,8 +153,44 @@ async fn run_session(ws: &mut DeviceSocket) -> Result<(), ConnectionError> {
                         ServerMsg::Welcome { .. } => {
                             return Err(ConnectionError::UnexpectedReply);
                         }
-                        ServerMsg::Capture { .. } | ServerMsg::Record { .. } => {
-                            return Err(ConnectionError::UnexpectedReply);
+                        ServerMsg::Capture { request_id, width, height, quality } => {
+                            match capture::validate_capture(width, height, quality) {
+                                Ok(()) => {
+                                    if !captures.is_empty() {
+                                        send_device_message(
+                                            ws,
+                                            DeviceMessage::CaptureFailed {
+                                                request_id,
+                                                code: MediaErrorCode::Busy,
+                                                message: "Camera is busy capturing another request".into() })
+                                        .await?;
+                                        continue;
+                                    } else {
+                                        println!("Capture started: request_id={}", request_id.get());
+                                        captures.push(async move {
+                                            let result = capture::capture_jpeg(width, height, quality).await;
+                                            (request_id, result)
+                                        });
+                                    }
+                                }
+                                Err(error) => {
+                                    let device_message = DeviceMessage::CaptureFailed {
+                                        request_id,
+                                        code: error.code(),
+                                        message: error.to_string(),
+                                    };
+                                    send_device_message(ws, device_message).await?;
+                                    continue;
+                                }
+                            }
+                        }
+                        ServerMsg::Record { request_id, .. } => {
+                            send_device_message(ws, DeviceMessage::RecordFailed {
+                                request_id,
+                                code: MediaErrorCode::Unavailable,
+                                message: "Audio recording is not implemented on this device yet".into(),
+                            }).await?;
+                            continue;
                         }
                     },
                     _ => return Err(ConnectionError::UnexpectedReply),
@@ -170,6 +220,48 @@ async fn run_session(ws: &mut DeviceSocket) -> Result<(), ConnectionError> {
                             println!("Temperature reading unavailable: {error}");
                             temperature_read_failed = true;
                         }
+                    }
+                }
+            }
+            Some((request_id, result)) = captures.next(), if !captures.is_empty() => {
+                match result {
+                    Ok(jpeg) => {
+                        let media_frame = MediaFrame {
+                            kind: MediaKind::Jpeg,
+                            request_id,
+                            payload: &jpeg
+                        };
+                        match media_frame.encode() {
+                            Ok(bytes) => {
+                                timeout(IO_TIMEOUT, ws.send(Message::Binary(bytes.into())))
+                                    .await
+                                    .map_err(|_| ConnectionError::Timeout("sending captured JPEG"))??;
+                                println!(
+                                    "Capture sent: request_id={}, jpeg_bytes={}",
+                                    request_id.get(),
+                                    jpeg.len()
+                                );
+                            }
+                            Err(error) => {
+                                send_device_message(ws, DeviceMessage::CaptureFailed {
+                                    request_id,
+                                    code: MediaErrorCode::Io,
+                                    message: format!("Failed to encode captured JPEG: {error}"),
+                                }).await?;
+                                continue;
+                            }
+                        };
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Capture failed: request_id={}, error={error}",
+                            request_id.get()
+                        );
+                        send_device_message(ws, DeviceMessage::CaptureFailed {
+                            request_id,
+                            code: error.code(),
+                            message: error.to_string()
+                        }).await?;
                     }
                 }
             }
