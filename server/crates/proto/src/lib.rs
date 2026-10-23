@@ -14,6 +14,12 @@ pub enum MessageType {
     Status,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BridgeEvent {
+    Tap { id: uuid::Uuid, taps: u8 },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeMessage {
     #[serde(rename = "type")]

@@ -1,6 +1,6 @@
 use super::*;
 use futures_util::{SinkExt, StreamExt};
-use hudagents_proto::MessageType;
+use hudagents_proto::{MessageType, device::RequestId};
 use tokio::{net::TcpStream, task::JoinHandle};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as ClientMessage,
@@ -60,6 +60,48 @@ fn state_with_subscriber() -> (AppState, broadcast::Receiver<String>) {
 
 fn camera_id() -> DeviceId {
     DeviceId::try_from("camera-01".to_owned()).unwrap()
+}
+
+// State-only tests keep the receiver alive to model an idle device handler.
+async fn register_idle_device(
+    state: &AppState,
+    stop_tx: oneshot::Sender<()>,
+) -> (u64, mpsc::Receiver<ServerMsg>) {
+    let (commands_tx, commands_rx) = mpsc::channel(4);
+    let connection_id = state
+        .register_device(camera_id(), stop_tx, commands_tx)
+        .await;
+    (connection_id, commands_rx)
+}
+
+async fn command_sender(state: &AppState) -> mpsc::Sender<ServerMsg> {
+    state
+        .active_device
+        .lock()
+        .await
+        .as_ref()
+        .expect("device should be registered")
+        .commands_tx
+        .clone()
+}
+
+fn capture_command(request_id: u64) -> ServerMsg {
+    ServerMsg::Capture {
+        request_id: RequestId::new(request_id),
+        width: 1920,
+        height: 1080,
+        quality: 85,
+    }
+}
+
+async fn expect_command_channel_closed(sender: &mpsc::Sender<ServerMsg>) {
+    timeout(TEST_TIMEOUT, sender.closed())
+        .await
+        .expect("device handler did not close its command receiver");
+    assert!(matches!(
+        sender.try_send(capture_command(999)),
+        Err(mpsc::error::TrySendError::Closed(_))
+    ));
 }
 
 async fn active_connection_id(state: &AppState) -> Option<u64> {
@@ -141,8 +183,11 @@ async fn assert_error_and_close(client: &mut Client, expected_code: ErrorCode) {
 async fn registration_stores_the_device_and_publishes_online() {
     let (state, mut statuses) = state_with_subscriber();
     let (stop_tx, mut stop_rx) = oneshot::channel();
+    let (commands_tx, _commands_rx) = mpsc::channel(4);
 
-    let connection_id = state.register_device(camera_id(), stop_tx).await;
+    let connection_id = state
+        .register_device(camera_id(), stop_tx, commands_tx.clone())
+        .await;
 
     assert_eq!(connection_id, 1);
     {
@@ -150,6 +195,7 @@ async fn registration_stores_the_device_and_publishes_online() {
         let device = active.as_ref().expect("device should be registered");
         assert_eq!(device.connection_id, connection_id);
         assert_eq!(device.device_id, camera_id());
+        assert!(device.commands_tx.same_channel(&commands_tx));
     }
     expect_status(&mut statuses, "Camera unit online", 1).await;
     assert!(matches!(
@@ -163,11 +209,11 @@ async fn registration_stores_the_device_and_publishes_online() {
 async fn replacement_signals_old_owner_and_ignores_its_late_cleanup() {
     let (state, mut statuses) = state_with_subscriber();
     let (first_tx, first_rx) = oneshot::channel();
-    let first_id = state.register_device(camera_id(), first_tx).await;
+    let (first_id, _first_commands_rx) = register_idle_device(&state, first_tx).await;
     let first_online = expect_status(&mut statuses, "Camera unit online", 1).await;
 
     let (second_tx, mut second_rx) = oneshot::channel();
-    let second_id = state.register_device(camera_id(), second_tx).await;
+    let (second_id, _second_commands_rx) = register_idle_device(&state, second_tx).await;
     let second_online = expect_status(&mut statuses, "Camera unit online", 2).await;
     assert!(second_id > first_id);
     assert_ne!(first_online.id, second_online.id);
@@ -208,12 +254,12 @@ async fn unregistering_an_empty_slot_does_not_publish_offline() {
 async fn replacement_succeeds_when_previous_stop_receiver_is_gone() {
     let (state, mut statuses) = state_with_subscriber();
     let (first_tx, first_rx) = oneshot::channel();
-    state.register_device(camera_id(), first_tx).await;
+    let (_first_id, _first_commands_rx) = register_idle_device(&state, first_tx).await;
     expect_status(&mut statuses, "Camera unit online", 1).await;
     drop(first_rx);
 
     let (second_tx, _second_rx) = oneshot::channel();
-    let second_id = state.register_device(camera_id(), second_tx).await;
+    let (second_id, _second_commands_rx) = register_idle_device(&state, second_tx).await;
     assert_eq!(active_connection_id(&state).await, Some(second_id));
     expect_status(&mut statuses, "Camera unit online", 2).await;
     assert_no_statuses(&mut statuses);
@@ -225,7 +271,7 @@ async fn registration_and_cleanup_work_without_display_subscribers() {
     drop(statuses);
     let (stop_tx, _stop_rx) = oneshot::channel();
 
-    let connection_id = state.register_device(camera_id(), stop_tx).await;
+    let (connection_id, _commands_rx) = register_idle_device(&state, stop_tx).await;
     assert_eq!(active_connection_id(&state).await, Some(connection_id));
     state.unregister_device(connection_id).await;
     assert_eq!(active_connection_id(&state).await, None);
@@ -235,13 +281,13 @@ async fn registration_and_cleanup_work_without_display_subscribers() {
 async fn connection_numbers_are_not_reused_after_disconnect() {
     let (state, mut statuses) = state_with_subscriber();
     let (first_tx, _first_rx) = oneshot::channel();
-    let first_id = state.register_device(camera_id(), first_tx).await;
+    let (first_id, _first_commands_rx) = register_idle_device(&state, first_tx).await;
     expect_status(&mut statuses, "Camera unit online", 1).await;
     state.unregister_device(first_id).await;
     expect_status(&mut statuses, "Camera unit offline", 2).await;
 
     let (second_tx, _second_rx) = oneshot::channel();
-    let second_id = state.register_device(camera_id(), second_tx).await;
+    let (second_id, _second_commands_rx) = register_idle_device(&state, second_tx).await;
     assert!(second_id > first_id);
     expect_status(&mut statuses, "Camera unit online", 3).await;
     state.unregister_device(first_id).await;
@@ -457,6 +503,256 @@ async fn binary_message_after_hello_closes_and_unregisters_the_owner() {
     assert_no_statuses(&mut statuses);
 }
 
+#[tokio::test]
+async fn capture_command_reaches_device_and_telemetry_continues_without_another_welcome() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut client = server.connect().await;
+    send_hello(&mut client).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    let owner = active_connection_id(&server.state).await;
+    let sender = command_sender(&server.state).await;
+    let command = capture_command(42);
+
+    sender.try_send(command.clone()).unwrap();
+    assert_eq!(receive_reply(&mut client).await, command);
+    send_telemetry(&mut client, 53_250).await;
+    expect_telemetry(&mut messages, 2, 53.25).await;
+
+    // An unintended welcome/error would arrive before the pong.
+    send(&mut client, ClientMessage::Ping(vec![42].into())).await;
+    assert_eq!(
+        receive(&mut client).await,
+        ClientMessage::Pong(vec![42].into())
+    );
+    assert_eq!(active_connection_id(&server.state).await, owner);
+    assert_no_statuses(&mut messages);
+    send(&mut client, ClientMessage::Close(None)).await;
+    expect_status(&mut messages, "Camera unit offline", 3).await;
+    expect_command_channel_closed(&sender).await;
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn command_queue_is_bounded_and_preserves_order_without_display_subscribers() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut client = server.connect().await;
+    send_hello(&mut client).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    drop(messages);
+    let sender = command_sender(&server.state).await;
+    assert_eq!(sender.max_capacity(), 4);
+    let commands = [
+        capture_command(1),
+        ServerMsg::Record {
+            request_id: RequestId::new(1),
+            duration_ms: 30_000,
+        },
+        capture_command(2),
+        ServerMsg::Record {
+            request_id: RequestId::new(2),
+            duration_ms: 30_000,
+        },
+    ];
+
+    // No await in this block: on the current-thread test runtime the handler
+    // cannot drain the queue until we have checked its exact capacity.
+    for command in &commands {
+        sender.try_send(command.clone()).unwrap();
+    }
+    let overflow = capture_command(3);
+    assert_eq!(
+        sender.try_send(overflow.clone()),
+        Err(mpsc::error::TrySendError::Full(overflow.clone()))
+    );
+    for command in commands {
+        assert_eq!(receive_reply(&mut client).await, command);
+    }
+    // Space becomes available again after draining; nothing was silently lost.
+    sender.try_send(overflow.clone()).unwrap();
+    assert_eq!(receive_reply(&mut client).await, overflow);
+    send(&mut client, ClientMessage::Close(None)).await;
+    expect_command_channel_closed(&sender).await;
+    assert_eq!(active_connection_id(&server.state).await, None);
+}
+
+#[tokio::test]
+async fn replacement_routes_commands_to_the_new_socket_and_closes_the_old_queue() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut first = server.connect().await;
+    send_hello(&mut first).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    let first_sender = command_sender(&server.state).await;
+
+    let mut second = server.connect().await;
+    send_hello(&mut second).await;
+    expect_status(&mut messages, "Camera unit online", 2).await;
+    let second_sender = command_sender(&server.state).await;
+    assert!(!first_sender.same_channel(&second_sender));
+    assert!(matches!(receive(&mut first).await, ClientMessage::Close(_)));
+    expect_command_channel_closed(&first_sender).await;
+
+    let command = capture_command(43);
+    second_sender.try_send(command.clone()).unwrap();
+    assert_eq!(receive_reply(&mut second).await, command);
+    assert_no_statuses(&mut messages);
+    send(&mut second, ClientMessage::Close(None)).await;
+    expect_status(&mut messages, "Camera unit offline", 3).await;
+    expect_command_channel_closed(&second_sender).await;
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn replacement_signal_takes_priority_over_a_queued_command() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut client = server.connect().await;
+    send_hello(&mut client).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    let old_sender = command_sender(&server.state).await;
+    let (replacement_stop_tx, _replacement_stop_rx) = oneshot::channel();
+
+    // Registration takes an uncontended lock and completes without yielding.
+    // Both stop and command are ready when the old handler is next polled.
+    old_sender.try_send(capture_command(44)).unwrap();
+    let (replacement_id, mut replacement_commands_rx) =
+        register_idle_device(&server.state, replacement_stop_tx).await;
+
+    expect_status(&mut messages, "Camera unit online", 2).await;
+    assert!(matches!(
+        receive(&mut client).await,
+        ClientMessage::Close(_)
+    ));
+    expect_command_channel_closed(&old_sender).await;
+    assert_eq!(
+        active_connection_id(&server.state).await,
+        Some(replacement_id)
+    );
+    // The old command is discarded, never transferred to the replacement.
+    assert!(matches!(
+        replacement_commands_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_no_statuses(&mut messages);
+    server.state.unregister_device(replacement_id).await;
+    expect_status(&mut messages, "Camera unit offline", 3).await;
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn disconnected_device_closes_its_queue_and_reconnect_gets_a_fresh_one() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut first = server.connect().await;
+    send_hello(&mut first).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    let old_sender = command_sender(&server.state).await;
+
+    drop(first);
+    expect_status(&mut messages, "Camera unit offline", 2).await;
+    expect_command_channel_closed(&old_sender).await;
+    assert_eq!(active_connection_id(&server.state).await, None);
+
+    let mut second = server.connect().await;
+    send_hello(&mut second).await;
+    expect_status(&mut messages, "Camera unit online", 3).await;
+    let new_sender = command_sender(&server.state).await;
+    assert!(!old_sender.same_channel(&new_sender));
+    let command = capture_command(45);
+    new_sender.try_send(command.clone()).unwrap();
+    assert_eq!(receive_reply(&mut second).await, command);
+    send(&mut second, ClientMessage::Close(None)).await;
+    expect_status(&mut messages, "Camera unit offline", 4).await;
+    expect_command_channel_closed(&new_sender).await;
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn unencodable_command_disconnects_and_unregisters_device_once() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut client = server.connect().await;
+    send_hello(&mut client).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    let sender = command_sender(&server.state).await;
+    let invalid = ServerMsg::error(
+        ErrorCode::InvalidMessage,
+        "x".repeat(MAX_CONTROL_MESSAGE_BYTES),
+    );
+    assert!(invalid.to_json().is_err());
+
+    sender.try_send(invalid).unwrap();
+    expect_status(&mut messages, "Camera unit offline", 2).await;
+    expect_command_channel_closed(&sender).await;
+    assert_eq!(active_connection_id(&server.state).await, None);
+    let response = timeout(TEST_TIMEOUT, client.next()).await.unwrap();
+    assert!(matches!(
+        response,
+        None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
+    ));
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+async fn closed_command_channel_ends_session_and_unregisters_device() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut client = server.connect().await;
+    send_hello(&mut client).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+
+    // Drop the real queue's last sender while preserving stop_tx and ownership.
+    // This isolates the recv() == None arm from the replacement signal.
+    let (unused_sender, _unused_receiver) = mpsc::channel(4);
+    {
+        let mut active = server.state.active_device.lock().await;
+        active.as_mut().unwrap().commands_tx = unused_sender;
+    }
+
+    expect_status(&mut messages, "Camera unit offline", 2).await;
+    assert_eq!(active_connection_id(&server.state).await, None);
+    let response = timeout(TEST_TIMEOUT, client.next()).await.unwrap();
+    assert!(matches!(
+        response,
+        None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
+    ));
+    assert_no_statuses(&mut messages);
+}
+
+#[tokio::test]
+#[ignore = "real-time command/silence check: about 30 seconds"]
+async fn outgoing_commands_do_not_extend_the_device_silence_deadline() {
+    let (server, mut messages) = TestServer::start().await;
+    let mut client = server.connect().await;
+    let started = Instant::now();
+    send_hello(&mut client).await;
+    expect_status(&mut messages, "Camera unit online", 1).await;
+    let sender = command_sender(&server.state).await;
+
+    // Do not poll the client again: automatic pongs would mask a broken reset.
+    for request_id in 1..=2 {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        sender.try_send(capture_command(request_id)).unwrap();
+        // Verify that the handler consumed the command before testing expiry.
+        timeout(TEST_TIMEOUT, async {
+            while sender.capacity() != sender.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("device handler did not consume the queued command");
+    }
+
+    let json = timeout_at(started + SILENCE_TIMEOUT + TEST_TIMEOUT, messages.recv())
+        .await
+        .expect("outgoing commands incorrectly kept the silent device online")
+        .unwrap();
+    let offline: BridgeMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(offline.msg_type, MessageType::Status);
+    assert_eq!(offline.body, "Camera unit offline");
+    assert_eq!(offline.seq, 2);
+    assert!(started.elapsed() >= SILENCE_TIMEOUT);
+    assert_eq!(active_connection_id(&server.state).await, None);
+    expect_command_channel_closed(&sender).await;
+    assert_no_statuses(&mut messages);
+    drop(client);
+}
+
 // These exercise the actual 10 s / 30 s timers. Run explicitly with --ignored
 // so routine protocol and ownership tests stay fast.
 #[tokio::test]
@@ -601,10 +897,10 @@ async fn telemetry_without_an_owner_is_ignored_without_consuming_a_sequence() {
 async fn telemetry_from_a_replaced_or_unregistered_owner_is_ignored() {
     let (state, mut messages) = state_with_subscriber();
     let (first_tx, first_rx) = oneshot::channel();
-    let first = state.register_device(camera_id(), first_tx).await;
+    let (first, _first_commands_rx) = register_idle_device(&state, first_tx).await;
     expect_status(&mut messages, "Camera unit online", 1).await;
     let (second_tx, _second_rx) = oneshot::channel();
-    let second = state.register_device(camera_id(), second_tx).await;
+    let (second, _second_commands_rx) = register_idle_device(&state, second_tx).await;
     expect_status(&mut messages, "Camera unit online", 2).await;
     timeout(TEST_TIMEOUT, first_rx).await.unwrap().unwrap();
 
@@ -625,7 +921,7 @@ async fn telemetry_from_a_replaced_or_unregistered_owner_is_ignored() {
 async fn telemetry_shares_sequence_numbers_with_text_and_status_and_uses_fresh_ids() {
     let (state, mut messages) = state_with_subscriber();
     let (stop_tx, _stop_rx) = oneshot::channel();
-    let connection = state.register_device(camera_id(), stop_tx).await;
+    let (connection, _commands_rx) = register_idle_device(&state, stop_tx).await;
     let online = expect_status(&mut messages, "Camera unit online", 1).await;
 
     assert!(state.publish_telemetry(connection, 53_250).await);
@@ -655,7 +951,7 @@ async fn telemetry_is_accepted_without_subscribers_and_new_subscribers_get_fresh
     let (state, messages) = state_with_subscriber();
     drop(messages);
     let (stop_tx, _stop_rx) = oneshot::channel();
-    let connection = state.register_device(camera_id(), stop_tx).await;
+    let (connection, _commands_rx) = register_idle_device(&state, stop_tx).await;
     assert!(state.publish_telemetry(connection, 53_250).await);
 
     let mut messages = state.messages.subscribe();

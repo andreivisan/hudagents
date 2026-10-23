@@ -10,6 +10,7 @@ axum = { version = "0.8.9", features = ["ws"] }
 hudagents-proto = { version = "0.1.0", path = "../proto" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+thiserror = "2"
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"

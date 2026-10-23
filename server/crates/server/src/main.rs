@@ -20,7 +20,7 @@ use axum::{
     routing::{get, post},
 };
 use hudagents_proto::{
-    BridgeMessage, BridgeTelemetry, MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION,
+    BridgeEvent, BridgeMessage, BridgeTelemetry, MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION,
     device::{DeviceId, DeviceMessage, ErrorCode, ServerMsg},
 };
 use serde::Deserialize;
@@ -28,7 +28,7 @@ use tokio::{
     sync::{
         Mutex,
         broadcast::{self, error::RecvError},
-        oneshot,
+        mpsc, oneshot,
     },
     time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout, timeout_at},
 };
@@ -42,6 +42,7 @@ struct ActiveDevice {
     connection_id: u64,
     device_id: DeviceId,
     stop_tx: oneshot::Sender<()>,
+    commands_tx: mpsc::Sender<ServerMsg>,
 }
 
 #[derive(Clone)]
@@ -98,13 +99,19 @@ impl AppState {
         true
     }
 
-    async fn register_device(&self, device_id: DeviceId, stop_tx: oneshot::Sender<()>) -> u64 {
+    async fn register_device(
+        &self,
+        device_id: DeviceId,
+        stop_tx: oneshot::Sender<()>,
+        commands_tx: mpsc::Sender<ServerMsg>,
+    ) -> u64 {
         let mut active_device = self.active_device.lock().await;
         let next_connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let new_active_device = ActiveDevice {
             connection_id: next_connection_id,
             device_id,
             stop_tx,
+            commands_tx,
         };
         tracing::info!(
             connection_id = new_active_device.connection_id,
@@ -182,10 +189,16 @@ async fn phone(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let receiver = state.messages.subscribe();
-    ws.on_upgrade(move |socket| handle_phone_socket(socket, receiver))
+    ws.max_message_size(MAX_CONTROL_MESSAGE_BYTES)
+        .max_frame_size(MAX_CONTROL_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_phone_socket(socket, receiver, state))
 }
 
-async fn handle_phone_socket(mut socket: WebSocket, mut receiver: broadcast::Receiver<String>) {
+async fn handle_phone_socket(
+    mut socket: WebSocket,
+    mut receiver: broadcast::Receiver<String>,
+    state: AppState,
+) {
     tracing::info!("Phone connected");
     loop {
         tokio::select! {
@@ -193,6 +206,24 @@ async fn handle_phone_socket(mut socket: WebSocket, mut receiver: broadcast::Rec
                 match incoming {
                     Some(Ok(Message::Close(_))) => {
                         break;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<BridgeEvent>(text.as_str()) {
+                            Ok(BridgeEvent::Tap { id, taps: 1 }) => {
+                                tracing::info!(tap_id = %id, "Glasses tap received");
+                                state.publish_status("Tap received");
+                            }
+                            Ok(BridgeEvent::Tap { id, taps }) => {
+                                tracing::warn!(
+                                    tap_id = %id,
+                                    taps,
+                                    "Unsupported glasses tap count"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "Invalid HudBridge event")
+                            }
+                        }
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
@@ -275,6 +306,8 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
     let mut connection_id: Option<u64> = None;
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let mut stop_tx = Some(stop_tx);
+    let (commands_tx, mut commands_rx) = mpsc::channel::<ServerMsg>(4);
+    let mut commands_tx = Some(commands_tx);
     let now = Instant::now();
     let mut ping_interval = interval_at(now + PING_INTERVAL, PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -320,6 +353,47 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                             break;
                         }
                     }
+            }
+            command = commands_rx.recv(), if connection_id.is_some() => {
+                match command {
+                    Some(cmd) => {
+                        match cmd.to_json() {
+                            Ok(json) => {
+                                let deadline = silence.deadline().min(Instant::now() + SEND_TIMEOUT);
+                                match timeout_at(deadline, socket.send(Message::Text(json.into()))).await {
+                                    Ok(Ok(())) => continue,
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(
+                                            ?connection_id,
+                                            %error,
+                                            "Device command send failed"
+                                        );
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            ?connection_id,
+                                            "Device command send timed out"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    ?connection_id,
+                                    %error,
+                                    "Failed to serialize device command"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::debug!(?connection_id, "Device command channel closed");
+                        break;
+                    }
+                }
             }
             received = socket.recv() => {
                 match received {
@@ -421,12 +495,14 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
         // Only a successfully sent welcome commits the handshake and announces the device.
         if let Some(id) = device_id {
             tracing::info!(device_id = id.as_str(), "Device hello accepted");
-            connection_id = match stop_tx.take() {
-                Some(sender) => Some(state.register_device(id, sender).await),
-                None => {
+            connection_id = match (stop_tx.take(), commands_tx.take()) {
+                (Some(stop_sender), Some(command_sender)) => {
+                    Some(state.register_device(id, stop_sender, command_sender).await)
+                }
+                _ => {
                     tracing::error!(
                         ?connection_id,
-                        "Missing stop sender during device registration"
+                        "Missing channels during device registration"
                     );
                     break;
                 }
