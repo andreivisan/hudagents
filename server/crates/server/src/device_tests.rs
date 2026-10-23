@@ -54,6 +54,7 @@ fn state_with_subscriber() -> (AppState, broadcast::Receiver<String>) {
         messages,
         phone_token: Arc::from("test-token"),
         next_seq: Arc::new(AtomicU64::new(1)),
+        next_request_id: Arc::new(AtomicU64::new(1)),
     };
     (state, receiver)
 }

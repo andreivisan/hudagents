@@ -21,7 +21,8 @@ use axum::{
 };
 use hudagents_proto::{
     BridgeEvent, BridgeMessage, BridgeTelemetry, MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION,
-    device::{DeviceId, DeviceMessage, ErrorCode, ServerMsg},
+    device::{DeviceId, DeviceMessage, ErrorCode, MediaErrorCode, RequestId, ServerMsg},
+    media::{MAX_BINARY_MESSAGE_BYTES, MEDIA_HEADER_BYTES, MediaFrame, MediaKind},
 };
 use serde::Deserialize;
 use tokio::{
@@ -33,9 +34,38 @@ use tokio::{
     time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout, timeout_at},
 };
 
+type CaptureResult = std::result::Result<Bytes, CaptureRequestError>;
+
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, thiserror::Error)]
+enum CaptureRequestError {
+    #[error("Perception device is offline")]
+    Unavailable,
+
+    #[error("Camera is busy capturing another request")]
+    Busy,
+
+    #[error("Device command queue is full; try again")]
+    QueueFull,
+
+    #[error("Device connection ended before capture completed")]
+    Disconnected,
+
+    #[error("No photo received within 15 seconds")]
+    Timeout,
+
+    #[error("Camera capture failed ({code:?}): {message}")]
+    DeviceFailed {
+        code: MediaErrorCode,
+        message: String,
+    },
+
+    #[error("Received empty or incomplete JPEG data")]
+    InvalidJpeg,
+}
 
 #[derive(Debug)]
 struct ActiveDevice {
@@ -43,6 +73,7 @@ struct ActiveDevice {
     device_id: DeviceId,
     stop_tx: oneshot::Sender<()>,
     commands_tx: mpsc::Sender<ServerMsg>,
+    pending_capture: Option<PendingCapture>,
 }
 
 #[derive(Clone)]
@@ -52,6 +83,7 @@ struct AppState {
     messages: broadcast::Sender<String>,
     phone_token: Arc<str>,
     next_seq: Arc<AtomicU64>,
+    next_request_id: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -112,6 +144,7 @@ impl AppState {
             device_id,
             stop_tx,
             commands_tx,
+            pending_capture: None,
         };
         tracing::info!(
             connection_id = new_active_device.connection_id,
@@ -153,11 +186,102 @@ impl AppState {
         }
         self.publish_status("Camera unit offline");
     }
+
+    async fn begin_capture(&self) -> std::result::Result<CaptureTicket, CaptureRequestError> {
+        let mut active_device = self.active_device.lock().await;
+        match active_device.as_mut() {
+            Some(device) => {
+                if device.pending_capture.is_some() {
+                    return Err(CaptureRequestError::Busy);
+                }
+                let next_request_id =
+                    RequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed));
+                let started_at = Instant::now();
+                let (capture_tx, capture_rx) = oneshot::channel::<CaptureResult>();
+                device.pending_capture = Some(PendingCapture {
+                    request_id: next_request_id,
+                    reply_tx: capture_tx,
+                });
+                let command = ServerMsg::Capture {
+                    request_id: next_request_id,
+                    width: 1920,
+                    height: 1080,
+                    quality: 85,
+                };
+                match device.commands_tx.try_send(command) {
+                    Ok(()) => Ok(CaptureTicket {
+                        connection_id: device.connection_id,
+                        request_id: next_request_id,
+                        started_at,
+                        reply_rx: capture_rx,
+                    }),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        device.pending_capture.take();
+                        return Err(CaptureRequestError::QueueFull);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        device.pending_capture.take();
+                        return Err(CaptureRequestError::Unavailable);
+                    }
+                }
+            }
+            None => Err(CaptureRequestError::Unavailable),
+        }
+    }
+
+    async fn complete_capture(
+        &self,
+        connection_id: u64,
+        request_id: RequestId,
+        result: CaptureResult,
+    ) -> bool {
+        let mut active_device = self.active_device.lock().await;
+        match active_device.as_mut() {
+            Some(device) => {
+                if device.connection_id != connection_id {
+                    return false;
+                }
+                match device.pending_capture.as_ref() {
+                    Some(pending) if pending.request_id != request_id => false,
+                    Some(pending) => match pending.take() {
+                        Some(pending) => match pending.reply_tx.send(result) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                tracing::debug!(
+                                    connection_id,
+                                    request_id = request_id.get(),
+                                    "Capture result receiver already closed"
+                                );
+                                return true;
+                            }
+                        },
+                        None => false,
+                    },
+                    None => false,
+                }
+            }
+            None => false,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct PhoneQuery {
     token: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingCapture {
+    request_id: RequestId,
+    reply_tx: oneshot::Sender<CaptureResult>,
+}
+
+#[derive(Debug)]
+struct CaptureTicket {
+    connection_id: u64,
+    request_id: RequestId,
+    started_at: Instant,
+    reply_rx: oneshot::Receiver<CaptureResult>,
 }
 
 async fn say(State(state): State<AppState>, request_body: String) -> StatusCode {
@@ -268,8 +392,8 @@ async fn handle_phone_socket(
 }
 
 async fn device(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.max_message_size(MAX_CONTROL_MESSAGE_BYTES)
-        .max_frame_size(MAX_CONTROL_MESSAGE_BYTES)
+    ws.max_message_size(MAX_BINARY_MESSAGE_BYTES)
+        .max_frame_size(MAX_BINARY_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_device_socket(socket, state))
 }
 
@@ -453,6 +577,45 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                     body_bytes = bytes.len(),
                     "Device message received"
                 );
+                let outcome = match message {
+                    match connection_id {
+                        Some(current_id) => {
+                            match MediaFrame::decode(&bytes) {
+                                Ok(frame) => {
+                                    match frame.kind {
+                                        MediaKind::Wav => {
+                                            Err(ServerMsg::error(
+                                                ErrorCode::UnexpectedMessage,
+                                                "Received WAV without a pending recording request".into(),
+                                            );
+                                        }
+                                        MediaKind::Jpeg => {
+                                            if frame.payload.len()
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        connection_id = current_id,
+                                        %error,
+                                        "Invalid device media frame"
+                                    );
+
+                                    Err(ServerMsg::error(
+                                        ErrorCode::InvalidMessage,
+                                        "Invalid device media frame".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        None => {
+                            Err(ServerMsg::error(
+                                ErrorCode::InvalidMessage,
+                                "Expected hello before binary media".into(),
+                            ));
+                        }
+                    }
+                }
                 Err(ServerMsg::error(
                     ErrorCode::InvalidMessage,
                     "Expected a JSON text message; binary messages are not supported".into(),
@@ -551,6 +714,7 @@ async fn main() -> Result<()> {
         messages: tx,
         phone_token: phone_token.into(),
         next_seq: Arc::new(AtomicU64::new(1)),
+        next_request_id: Arc::new(AtomicU64::new(1)),
     };
     let app = Router::new()
         .route("/say", post(say))
@@ -608,6 +772,7 @@ mod tests {
             messages,
             phone_token: Arc::from("test-token"),
             next_seq: Arc::new(AtomicU64::new(1)),
+            next_request_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
