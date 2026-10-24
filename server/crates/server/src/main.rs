@@ -39,6 +39,7 @@ type CaptureResult = std::result::Result<Bytes, CaptureRequestError>;
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
+const CAPTURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 enum CaptureRequestError {
@@ -217,11 +218,11 @@ impl AppState {
                     }),
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         device.pending_capture.take();
-                        return Err(CaptureRequestError::QueueFull);
+                        Err(CaptureRequestError::QueueFull)
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         device.pending_capture.take();
-                        return Err(CaptureRequestError::Unavailable);
+                        Err(CaptureRequestError::Unavailable)
                     }
                 }
             }
@@ -243,7 +244,7 @@ impl AppState {
                 }
                 match device.pending_capture.as_ref() {
                     Some(pending) if pending.request_id != request_id => false,
-                    Some(pending) => match pending.take() {
+                    Some(_) => match device.pending_capture.take() {
                         Some(pending) => match pending.reply_tx.send(result) {
                             Ok(()) => true,
                             Err(_) => {
@@ -252,7 +253,7 @@ impl AppState {
                                     request_id = request_id.get(),
                                     "Capture result receiver already closed"
                                 );
-                                return true;
+                                true
                             }
                         },
                         None => false,
@@ -261,6 +262,43 @@ impl AppState {
                 }
             }
             None => false,
+        }
+    }
+
+    async fn clear_pending_capture(&self, connection_id: u64, request_id: RequestId) -> bool {
+        let mut active_device = self.active_device.lock().await;
+        match active_device.as_mut() {
+            Some(device) => {
+                if device.connection_id != connection_id {
+                    return false;
+                }
+                match device.pending_capture.as_ref() {
+                    Some(pending) if pending.request_id != request_id => false,
+                    Some(_) => {
+                        device.pending_capture.take();
+                        true
+                    }
+                    None => false,
+                }
+            }
+            None => false,
+        }
+    }
+
+    async fn wait_for_capture(&self, ticket: CaptureTicket) -> CaptureResult {
+        let CaptureTicket {
+            connection_id,
+            request_id,
+            started_at,
+            reply_rx,
+        } = ticket;
+        match timeout_at(started_at + CAPTURE_REQUEST_TIMEOUT, reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(CaptureRequestError::Disconnected),
+            Err(_) => {
+                self.clear_pending_capture(connection_id, request_id).await;
+                Err(CaptureRequestError::Timeout)
+            }
         }
     }
 }
@@ -335,7 +373,58 @@ async fn handle_phone_socket(
                         match serde_json::from_str::<BridgeEvent>(text.as_str()) {
                             Ok(BridgeEvent::Tap { id, taps: 1 }) => {
                                 tracing::info!(tap_id = %id, "Glasses tap received");
-                                state.publish_status("Tap received");
+                                match state.begin_capture().await {
+                                    Ok(ticket) => {
+                                        let CaptureTicket {
+                                            connection_id,
+                                            request_id,
+                                            started_at,
+                                            ..
+                                        } = ticket;
+                                        tracing::info!(
+                                            tap_id = %id,
+                                            connection_id,
+                                            request_id = request_id.get(),
+                                            "Capture requested"
+                                        );
+                                        state.publish_status("Taking picture...");
+                                        let capture_state = state.clone();
+                                        let _capture_task = tokio::spawn(async move {
+                                            match capture_state.wait_for_capture(ticket).await {
+                                                Ok(jpeg) => {
+                                                    tracing::info!(
+                                                        tap_id = %id,
+                                                        connection_id,
+                                                        request_id = request_id.get(),
+                                                        jpeg_bytes = jpeg.len(),
+                                                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                                        "Photo received from perception device"
+                                                    );
+                                                    capture_state.publish_status("Photo received");
+                                                }
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        tap_id = %id,
+                                                        connection_id,
+                                                        request_id = request_id.get(),
+                                                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                                        %error,
+                                                        "Capture request failed"
+                                                    );
+                                                    capture_state.publish_status(&error.to_string());
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            tap_id = %id,
+                                            %error,
+                                            "Capture request rejected"
+                                        );
+                                        state.publish_status(&error.to_string());
+                                    }
+                                }
                             }
                             Ok(BridgeEvent::Tap { id, taps }) => {
                                 tracing::warn!(
@@ -564,10 +653,29 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                         ErrorCode::UnexpectedMessage,
                         "Device has already completed its hello".to_string(),
                     )),
-                    (Some(_), Ok(DeviceMessage::CaptureFailed { .. }))
-                    | (Some(_), Ok(DeviceMessage::RecordFailed { .. })) => Err(ServerMsg::error(
+                    (
+                        Some(current_id),
+                        Ok(DeviceMessage::CaptureFailed {
+                            request_id,
+                            code,
+                            message,
+                        }),
+                    ) => {
+                        let result = Err(CaptureRequestError::DeviceFailed { code, message });
+                        if state.complete_capture(current_id, request_id, result).await {
+                            silence.as_mut().reset(Instant::now() + SILENCE_TIMEOUT);
+                        } else {
+                            tracing::debug!(
+                                connection_id = current_id,
+                                request_id = request_id.get(),
+                                "Ignored unmatched capture failure"
+                            );
+                        }
+                        continue;
+                    }
+                    (Some(_), Ok(DeviceMessage::RecordFailed { .. })) => Err(ServerMsg::error(
                         ErrorCode::UnexpectedMessage,
-                        "Received a media failure without a pending request".to_string(),
+                        "Received a media failure without a pending request".into(),
                     )),
                 }
             }
@@ -577,49 +685,54 @@ async fn handle_device_socket(mut socket: WebSocket, state: AppState) {
                     body_bytes = bytes.len(),
                     "Device message received"
                 );
-                let outcome = match message {
-                    match connection_id {
-                        Some(current_id) => {
-                            match MediaFrame::decode(&bytes) {
-                                Ok(frame) => {
-                                    match frame.kind {
-                                        MediaKind::Wav => {
-                                            Err(ServerMsg::error(
-                                                ErrorCode::UnexpectedMessage,
-                                                "Received WAV without a pending recording request".into(),
-                                            );
-                                        }
-                                        MediaKind::Jpeg => {
-                                            if frame.payload.len()
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        connection_id = current_id,
-                                        %error,
-                                        "Invalid device media frame"
-                                    );
+                match connection_id {
+                    Some(current_id) => match MediaFrame::decode(&bytes) {
+                        Ok(frame) => match frame.kind {
+                            MediaKind::Wav => Err(ServerMsg::error(
+                                ErrorCode::UnexpectedMessage,
+                                "Received WAV without a pending recording request".into(),
+                            )),
+                            MediaKind::Jpeg => {
+                                let request_id = frame.request_id;
+                                let result: CaptureResult = if frame.payload.len() >= 4
+                                    && frame.payload.starts_with(&[0xFF, 0xD8])
+                                    && frame.payload.ends_with(&[0xFF, 0xD9])
+                                {
+                                    Ok(bytes.slice(MEDIA_HEADER_BYTES..))
+                                } else {
+                                    Err(CaptureRequestError::InvalidJpeg)
+                                };
 
-                                    Err(ServerMsg::error(
-                                        ErrorCode::InvalidMessage,
-                                        "Invalid device media frame".into(),
-                                    ));
+                                if state.complete_capture(current_id, request_id, result).await {
+                                    silence.as_mut().reset(Instant::now() + SILENCE_TIMEOUT);
+                                } else {
+                                    tracing::debug!(
+                                        connection_id = current_id,
+                                        request_id = request_id.get(),
+                                        "Ignored unmatched JPEG result"
+                                    );
                                 }
+                                continue;
                             }
-                        }
-                        None => {
+                        },
+                        Err(error) => {
+                            tracing::warn!(
+                                connection_id = current_id,
+                                %error,
+                                "Invalid device media frame"
+                            );
+
                             Err(ServerMsg::error(
                                 ErrorCode::InvalidMessage,
-                                "Expected hello before binary media".into(),
-                            ));
+                                "Invalid device media frame".into(),
+                            ))
                         }
-                    }
+                    },
+                    None => Err(ServerMsg::error(
+                        ErrorCode::InvalidMessage,
+                        "Expected hello before binary media".into(),
+                    )),
                 }
-                Err(ServerMsg::error(
-                    ErrorCode::InvalidMessage,
-                    "Expected a JSON text message; binary messages are not supported".into(),
-                ))
             }
             Message::Ping(_) | Message::Pong(_) => {
                 if connection_id.is_some() {

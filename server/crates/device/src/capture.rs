@@ -6,7 +6,7 @@ use hudagents_proto::{
 };
 use tokio::{io::AsyncReadExt, process::Child, time::timeout};
 
-pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_JPEG_BYTES: usize = MAX_BINARY_MESSAGE_BYTES - MEDIA_HEADER_BYTES;
 
@@ -26,7 +26,7 @@ pub enum CaptureError {
     #[error("rpicam-still failed with {status}")]
     ProcessFailed { status: std::process::ExitStatus },
 
-    #[error("Camera capture timed out after 5 seconds")]
+    #[error("Camera capture timed out after 10 seconds")]
     Timeout,
 
     #[error("Camera JPEG exceeded the {limit}-byte payload limit")]
@@ -94,7 +94,7 @@ pub async fn capture_jpeg(width: u16, height: u16, quality: u8) -> Result<Vec<u8
         }
     };
 
-    // Both reading stdout and waiting for exit share the same five-second budget.
+    // Reading stdout and waiting for exit share the same capture timeout.
     let timed_result = timeout(CAPTURE_TIMEOUT, async {
         // One extra byte distinguishes an oversized JPEG from one exactly at the limit.
         let mut reader = stdout.take((MAX_JPEG_BYTES + 1) as u64);

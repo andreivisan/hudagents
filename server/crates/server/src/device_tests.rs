@@ -22,6 +22,7 @@ impl TestServer {
         let (state, receiver) = state_with_subscriber();
         let app = Router::new()
             .route("/device", get(device))
+            .route("/phone", get(phone))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/device", listener.local_addr().unwrap());
@@ -841,7 +842,7 @@ async fn welcome_does_not_require_a_display_subscriber() {
 }
 
 #[tokio::test]
-async fn oversized_hello_is_rejected_at_websocket_layer() {
+async fn oversized_control_json_gets_an_error_before_close() {
     let (server, mut statuses) = TestServer::start().await;
     let mut client = server.connect().await;
     let oversized = format!(
@@ -849,13 +850,7 @@ async fn oversized_hello_is_rejected_at_websocket_layer() {
         " ".repeat(MAX_CONTROL_MESSAGE_BYTES + 1 - HELLO.len())
     );
     send(&mut client, ClientMessage::Text(oversized.into())).await;
-    let response = timeout(TEST_TIMEOUT, client.next())
-        .await
-        .expect("oversized connection did not end");
-    assert!(matches!(
-        response,
-        None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
-    ));
+    assert_error_and_close(&mut client, ErrorCode::InvalidMessage).await;
     assert!(matches!(
         statuses.try_recv(),
         Err(broadcast::error::TryRecvError::Empty)
@@ -1151,3 +1146,5 @@ async fn telemetry_resets_silence_with_and_without_display_subscribers() {
         check_telemetry_keeps_device_online(false),
     );
 }
+
+mod capture_tests;
